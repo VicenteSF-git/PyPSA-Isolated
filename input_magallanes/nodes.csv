@@ -1,0 +1,6 @@
+zone,annual_mean_mw,annual_heat_mean_mw,existing_gas_boiler_mw,installed_heat_pump_mw,allow_heat_pump,heat_pump_cop,gas_boiler_efficiency,lat,lon,enabled
+# zone[name],annual_mean_mw[MW],annual_heat_mean_mw[MW],existing_gas_boiler_mw[MW],installed_heat_pump_mw[MW],allow_heat_pump[bool],heat_pump_cop[MWth/MWel],gas_boiler_efficiency[fraction],lat[degrees],lon[degrees],enabled[bool]
+natales,12.0,6.0,8.0,0.0,True,3.0,0.90,-51.73,-72.50,True
+puntaarenas,38.0,20.0,28.0,0.0,True,3.0,0.90,-53.16,-70.91,True
+porvenir,9.0,4.0,6.0,0.0,True,3.0,0.90,-53.30,-70.36,True
+puertowilliams,4.0,2.0,3.0,0.0,True,3.0,0.90,-54.93,-67.61,True

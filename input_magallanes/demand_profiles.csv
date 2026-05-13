@@ -1,0 +1,26 @@
+# Demand profiles for Magallanes case study.
+# Format: timestamp (hourly, matching snapshots), zone, demand_type, demand_mw
+# demand_type: electricity, heat, hydrogen, or any custom type.
+# If this file is absent or incomplete, synthetic fallback profiles are generated
+# from annual_mean_mw / annual_heat_mean_mw in nodes.csv.
+#
+# Example rows (replace with real data):
+timestamp,zone,demand_type,demand_mw
+2030-01-01 00:00,natales,electricity,11.5
+2030-01-01 01:00,natales,electricity,10.8
+2030-01-01 02:00,natales,electricity,10.2
+2030-01-01 00:00,puntaarenas,electricity,36.2
+2030-01-01 01:00,puntaarenas,electricity,34.5
+2030-01-01 02:00,puntaarenas,electricity,33.1
+2030-01-01 00:00,porvenir,electricity,8.6
+2030-01-01 01:00,porvenir,electricity,8.1
+2030-01-01 02:00,porvenir,electricity,7.8
+2030-01-01 00:00,puertowilliams,electricity,3.8
+2030-01-01 01:00,puertowilliams,electricity,3.6
+2030-01-01 02:00,puertowilliams,electricity,3.4
+2030-01-01 00:00,natales,heat,7.2
+2030-01-01 01:00,natales,heat,7.0
+2030-01-01 02:00,natales,heat,6.8
+2030-01-01 00:00,puntaarenas,heat,22.5
+2030-01-01 01:00,puntaarenas,heat,21.8
+2030-01-01 02:00,puntaarenas,heat,21.2

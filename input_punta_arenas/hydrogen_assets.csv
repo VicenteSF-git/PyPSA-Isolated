@@ -1,0 +1,9 @@
+zone,asset_type,installed_capacity_mw,installed_energy_mwh,capital_cost,marginal_cost,efficiency,standing_loss,available_from_year,enabled
+# zone[name],asset_type[name],installed_capacity_mw[MW],installed_energy_mwh[MWh],capital_cost[USD/MW],marginal_cost[USD/MWh],efficiency[fraction],standing_loss[fraction/hour],available_from_year[year],enabled[bool]
+punta_arenas_2,electrolyzer,0,,90000,0,0.70,,2030,True
+punta_arenas_2,h2_store_tank,,0,2500,0,,0.0005,2030,True
+punta_arenas_2,h2_fuel_cell,0,,100000,0,0.55,,2030,True
+punta_arenas_2,h2_turbine,0,,85000,0,0.45,,2030,True
+punta_arenas_2,uhs_injection,0,,20000,0,0.98,,2030,True
+punta_arenas_2,uhs_withdrawal,0,,25000,0,0.98,,2030,True
+punta_arenas_2,uhs_store,,0,1200,0,,0.0001,2030,True

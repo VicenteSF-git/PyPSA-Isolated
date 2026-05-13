@@ -1,0 +1,3 @@
+parameter,value,unit,enabled
+# parameter[name],value[number/text],unit[text],enabled[bool]
+slack_cost_per_mwh,500,USD/MWh,True

@@ -1,0 +1,2477 @@
+"""
+Generic PyPSA configuration and optimization module.
+
+This module is case-agnostic and uses CSV inputs for nodes, generators,
+interlinks, storage, and optional technology costs.
+"""
+
+from __future__ import annotations
+
+import logging
+import warnings
+from pathlib import Path
+from typing import Dict, Iterable, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import pypsa
+
+from build_demand import build_demands
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+
+
+DEFAULT_PATHS = {
+    "nodes_csv": "input_magallanes/nodes.csv",
+    "interlinks_csv": "input_magallanes/interlinks.csv",
+    "capacity_csv": "input_magallanes/generators_capacity.csv",
+    "storage_csv": "input_magallanes/storage_capacity.csv",
+    "hydrogen_csv": "input_magallanes/hydrogen_assets.csv",
+    "costs_csv": "input_magallanes/costs.csv",
+    "general_csv": "input_magallanes/general.csv",
+    "demand_csv": "input_magallanes/demand_profiles.csv",
+    "demand_summary_csv": "input_magallanes/demand_validation_summary.csv",
+}
+
+
+def configure_runtime_output() -> None:
+    """Configure logging and filter noisy warnings from dependencies."""
+    logging.getLogger("linopy").setLevel(logging.WARNING)
+    logging.getLogger("pypsa").setLevel(logging.WARNING)
+    logging.getLogger("gurobipy").setLevel(logging.WARNING)
+
+    warnings.filterwarnings("ignore", message=r".*TripleDES.*", category=Warning)
+    warnings.filterwarnings("ignore", message=r".*Blowfish.*", category=Warning)
+    warnings.filterwarnings(
+        "ignore",
+        message=".*incompatible dtype.*",
+        category=FutureWarning,
+        module=r"pypsa\.components",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Dataset\.dims.*",
+        category=FutureWarning,
+        module=r"linopy\.expressions",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=".*groupby with axis=1 is deprecated.*",
+        category=FutureWarning,
+        module=r"pypsa\..*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=".*chained assignment using an inplace method.*",
+        category=FutureWarning,
+        module=r"pypsa\.optimization\.optimize",
+    )
+
+
+configure_runtime_output()
+
+
+def get_case_paths(case_folder: str = "input_magallanes") -> dict:
+    """
+    Get input CSV paths for a specific case folder.
+    
+    Parameters
+    ----------
+    case_folder : str
+        Name of the input folder (e.g., 'input_magallanes', 'input_patagonia')
+    
+    Returns
+    -------
+    dict
+        Dictionary with paths to all required CSV files
+    
+    Example
+    -------
+    >>> paths = get_case_paths("input_magallanes")
+    >>> result = run_case(**paths, year=2030)
+    """
+    return {
+        "csv_nodes": f"{case_folder}/nodes.csv",
+        "csv_interlinks": f"{case_folder}/interlinks.csv",
+        "csv_capacity": f"{case_folder}/generators_capacity.csv",
+        "csv_storage": f"{case_folder}/storage_capacity.csv",
+        "csv_hydrogen": f"{case_folder}/hydrogen_assets.csv",
+        "csv_costs": f"{case_folder}/costs.csv",
+        "csv_general": f"{case_folder}/general.csv",
+        "csv_demand": "demand_profiles.csv",
+        "csv_demand_summary": "demand_validation_summary.csv",
+    }
+
+
+def _resolve_csv_path(preferred_path: str) -> Path:
+    """Resolve CSV path for the selected case folder."""
+    preferred = Path(preferred_path)
+    if preferred.is_absolute():
+        return preferred
+    return PROJECT_DIR / preferred
+
+
+def _read_csv(csv_file: Path) -> pd.DataFrame:
+    """Read CSV while ignoring comment lines (prefixed with '#')."""
+    return pd.read_csv(csv_file, comment="#")
+
+
+def _require_columns(df: pd.DataFrame, required: Iterable[str], csv_file: Path) -> None:
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in {csv_file}: {missing}")
+
+
+def load_nodes_from_csv(
+    csv_path: str = DEFAULT_PATHS["nodes_csv"],
+) -> Optional[pd.DataFrame]:
+    """
+    Load nodes from CSV.
+
+    Expected columns:
+    - zone
+    - annual_mean_mw
+
+    Optional columns:
+    - lat
+    - lon
+    - enabled
+    - annual_heat_mean_mw
+    - existing_gas_boiler_mw
+    - installed_heat_pump_mw
+    - allow_heat_pump
+    - heat_pump_cop
+    - gas_boiler_efficiency
+    """
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return None
+
+    df = _read_csv(csv_file)
+    _require_columns(df, ["zone", "annual_mean_mw"], csv_file)
+
+    if "enabled" not in df.columns:
+        df["enabled"] = True
+
+    if "lat" not in df.columns:
+        df["lat"] = np.nan
+    if "lon" not in df.columns:
+        df["lon"] = np.nan
+
+    df = df[df["enabled"] == True].copy()  # noqa: E712
+    return df.reset_index(drop=True)
+
+
+def load_interlinks_from_csv(
+    csv_path: str = DEFAULT_PATHS["interlinks_csv"],
+) -> Optional[list]:
+    """
+    Load interconnections from CSV.
+
+    Expected columns:
+    - from_zone
+    - to_zone
+    - capacity_mw
+    - loss_fraction
+
+    Optional columns:
+    - enabled
+    """
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return None
+
+    df = _read_csv(csv_file)
+    _require_columns(df, ["from_zone", "to_zone", "capacity_mw", "loss_fraction"], csv_file)
+
+    if "enabled" in df.columns:
+        df = df[df["enabled"] == True].copy()  # noqa: E712
+
+    interlinks = []
+    for _, row in df.iterrows():
+        interlinks.append(
+            {
+                "from_zone": row["from_zone"],
+                "to_zone": row["to_zone"],
+                "capacity_mw": row["capacity_mw"],
+                "loss_fraction": row["loss_fraction"],
+            }
+        )
+
+    return interlinks if interlinks else None
+
+
+def load_generator_capacity_from_csv(
+    csv_path: str = DEFAULT_PATHS["capacity_csv"],
+) -> Optional[pd.DataFrame]:
+    """
+    Load generator capacities and costs from CSV.
+
+    Required columns:
+    - generator
+    - zone
+    - installed_capacity
+    """
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return None
+
+    df = _read_csv(csv_file)
+    _require_columns(df, ["generator", "zone", "installed_capacity"], csv_file)
+    return df
+
+
+def load_storage_capacity_from_csv(
+    csv_path: str = DEFAULT_PATHS["storage_csv"],
+) -> Optional[pd.DataFrame]:
+    """Load storage parameters from CSV."""
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return None
+
+    return _read_csv(csv_file)
+
+
+def load_hydrogen_assets_from_csv(
+    csv_path: str = DEFAULT_PATHS["hydrogen_csv"],
+) -> Optional[pd.DataFrame]:
+    """
+    Load optional hydrogen assets from CSV.
+
+    Required columns:
+    - zone
+    - asset_type
+
+    Supported asset_type values:
+    - electrolyzer
+    - h2_fuel_cell
+    - h2_turbine
+    - h2_store_tank (aliases: h2_tank, tank)
+    - uhs_injection
+    - uhs_withdrawal
+    - uhs_store
+    - uhs (aliases: h2_uhs, h2_store_uhs)
+
+    Optional columns:
+    - installed_capacity_mw (for Link-based assets)
+    - installed_energy_mwh (for Store-based assets)
+    - capital_cost
+    - marginal_cost
+    - efficiency
+    - standing_loss (Store only)
+    - available_from_year
+    - enabled
+
+    Optional UHS-specific columns (fallback to generic values if omitted):
+    - injection_capacity_mw
+    - withdrawal_capacity_mw
+    - injection_efficiency
+    - withdrawal_efficiency
+    - injection_capital_cost
+    - withdrawal_capital_cost
+    - injection_marginal_cost
+    - withdrawal_marginal_cost
+    - injection_available_from_year
+    - withdrawal_available_from_year
+    - store_available_from_year
+
+        For explicit UHS asset rows:
+        - uhs_injection: uses installed_capacity_mw, efficiency, capital_cost,
+            marginal_cost, available_from_year.
+        - uhs_withdrawal: uses installed_capacity_mw, efficiency, capital_cost,
+            marginal_cost, available_from_year.
+        - uhs_store: uses installed_energy_mwh, standing_loss, capital_cost,
+            marginal_cost, available_from_year.
+    """
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return None
+
+    df = _read_csv(csv_file)
+    _require_columns(df, ["zone", "asset_type"], csv_file)
+
+    if "enabled" in df.columns:
+        df = df[df["enabled"] == True].copy()  # noqa: E712
+
+    return df.reset_index(drop=True)
+
+
+def load_technology_costs_from_csv(
+    csv_path: str = DEFAULT_PATHS["costs_csv"],
+) -> Optional[pd.DataFrame]:
+    """
+    Load optional technology-level costs from CSV.
+
+    Recommended columns:
+    - technology
+    - year (optional, to define year-specific rows)
+    - capital_cost
+    - marginal_cost
+    - efficiency
+    - co2_emissions
+
+    Optional projection columns (annual compound rate):
+    - base_year (defaults to row year if available)
+    - annual_change (applies to capital_cost and marginal_cost if specific rates are absent)
+    - capital_cost_annual_change
+    - marginal_cost_annual_change
+    - co2_emissions_annual_change
+
+    Storage-specific optional columns:
+    - max_hours
+    - efficiency_store
+    - efficiency_dispatch
+    - standing_loss
+    """
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return None
+
+    df = _read_csv(csv_file)
+    _require_columns(df, ["technology"], csv_file)
+    return df
+
+
+def _normalize_annual_rate(rate) -> Optional[float]:
+    """Normalize annual rate to decimal; supports decimal and percentage inputs."""
+    if rate is None or pd.isna(rate):
+        return None
+
+    parsed = float(rate)
+    if abs(parsed) > 1.0:
+        return parsed / 100.0
+    return parsed
+
+
+def _select_cost_rows_for_year(costs_df: pd.DataFrame, year: int) -> pd.DataFrame:
+    """Select one row per technology for the requested year.
+
+    Priority per technology:
+    1) Exact match in `year`
+    2) Latest available row before target year
+    3) Earliest available row after target year
+    4) Static row without `year` value
+    """
+    if costs_df.empty or "technology" not in costs_df.columns:
+        return costs_df
+
+    if "year" not in costs_df.columns:
+        return costs_df.copy()
+
+    table = costs_df.copy()
+    table["_year_num"] = pd.to_numeric(table["year"], errors="coerce")
+    out_rows = []
+
+    for technology, tech_rows in table.groupby(table["technology"].astype(str), sort=False):
+        yearly = tech_rows[tech_rows["_year_num"].notna()].copy()
+        static = tech_rows[tech_rows["_year_num"].isna()].copy()
+
+        selected = None
+        if not yearly.empty:
+            yearly = yearly.sort_values("_year_num")
+            exact = yearly[yearly["_year_num"] == float(year)]
+            if not exact.empty:
+                selected = exact.iloc[-1]
+            else:
+                past = yearly[yearly["_year_num"] < float(year)]
+                if not past.empty:
+                    selected = past.iloc[-1]
+                else:
+                    future = yearly[yearly["_year_num"] > float(year)]
+                    if not future.empty:
+                        selected = future.iloc[0]
+
+        if selected is None and not static.empty:
+            selected = static.iloc[-1]
+
+        if selected is not None:
+            out_rows.append(selected)
+
+    if not out_rows:
+        return pd.DataFrame(columns=costs_df.columns)
+
+    selected_df = pd.DataFrame(out_rows).copy()
+    if "_year_num" in selected_df.columns:
+        selected_df = selected_df.drop(columns=["_year_num"])
+    return selected_df.reset_index(drop=True)
+
+
+def _project_costs_for_year(costs_df: Optional[pd.DataFrame], year: Optional[int]) -> Optional[pd.DataFrame]:
+    """Resolve technology costs for model year using optional annual projection rates."""
+    if costs_df is None or costs_df.empty or year is None:
+        return costs_df
+
+    selected = _select_cost_rows_for_year(costs_df, int(year))
+    if selected.empty:
+        return selected
+
+    out = selected.copy()
+    for idx, row in out.iterrows():
+        if "base_year" in out.columns and not pd.isna(row.get("base_year")):
+            base_year = int(float(row.get("base_year")))
+        elif "year" in out.columns and not pd.isna(row.get("year")):
+            base_year = int(float(row.get("year")))
+        else:
+            base_year = int(year)
+
+        delta_years = int(year) - base_year
+        generic_rate = _normalize_annual_rate(row.get("annual_change", np.nan))
+
+        projection_pairs = [
+            ("capital_cost", "capital_cost_annual_change"),
+            ("marginal_cost", "marginal_cost_annual_change"),
+            ("co2_emissions", "co2_emissions_annual_change"),
+        ]
+
+        for value_col, rate_col in projection_pairs:
+            if value_col not in out.columns:
+                continue
+            value = row.get(value_col)
+            if pd.isna(value):
+                continue
+
+            specific_rate = _normalize_annual_rate(row.get(rate_col, np.nan))
+            rate = specific_rate if specific_rate is not None else generic_rate
+            if rate is None:
+                continue
+
+            out.at[idx, value_col] = float(value) * ((1.0 + rate) ** delta_years)
+
+    return out
+
+
+def load_general_settings_from_csv(
+    csv_path: str = DEFAULT_PATHS["general_csv"],
+) -> dict:
+    """
+    Load optional global settings from CSV.
+
+    Expected columns:
+    - parameter
+    - value
+
+    Optional columns:
+    - enabled
+    """
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return {}
+
+    df = _read_csv(csv_file)
+    if df.empty:
+        return {}
+
+    _require_columns(df, ["parameter", "value"], csv_file)
+
+    if "enabled" in df.columns:
+        enabled = df["enabled"]
+        if pd.api.types.is_bool_dtype(enabled):
+            df = df[enabled].copy()
+        else:
+            df = df[enabled.astype(str).str.lower().isin(["true", "1", "yes", "y"])].copy()
+
+    settings = {}
+    for _, row in df.iterrows():
+        key = str(row["parameter"]).strip()
+        if not key:
+            continue
+        settings[key] = row["value"]
+
+    return settings
+
+
+def _resolve_slack_cost(
+    slack_cost_per_mwh: Optional[float],
+    general_settings: Optional[dict] = None,
+    default: float = 500.0,
+) -> float:
+    """Resolve slack penalty priority: arg > general.csv > default."""
+    if slack_cost_per_mwh is not None and not pd.isna(slack_cost_per_mwh):
+        return float(slack_cost_per_mwh)
+
+    if general_settings and "slack_cost_per_mwh" in general_settings:
+        value = general_settings.get("slack_cost_per_mwh")
+        if value is not None and not pd.isna(value):
+            return float(value)
+
+    return float(default)
+
+
+def _apply_cost_defaults(
+    capacity_df: Optional[pd.DataFrame],
+    storage_df: Optional[pd.DataFrame],
+    costs_df: Optional[pd.DataFrame],
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """Fill missing technology-specific columns in generator/storage CSVs from costs CSV."""
+    if costs_df is None:
+        return capacity_df, storage_df
+
+    capacity_output = capacity_df.copy() if capacity_df is not None else None
+    storage_output = storage_df.copy() if storage_df is not None else None
+
+    if capacity_output is not None:
+        for _, row in costs_df.iterrows():
+            technology = str(row["technology"])
+            mask = capacity_output["generator"].astype(str) == technology
+            if "technology" in capacity_output.columns:
+                mask = mask | (capacity_output["technology"].astype(str) == technology)
+
+            for col in ["capital_cost", "marginal_cost", "efficiency"]:
+                if col in row.index:
+                    if col not in capacity_output.columns:
+                        capacity_output[col] = np.nan
+                    capacity_output.loc[mask & capacity_output[col].isna(), col] = row[col]
+
+    if storage_output is not None and not costs_df.empty:
+        # Pick the first row matching a common storage technology label.
+        storage_cost_row = costs_df[costs_df["technology"].astype(str).isin(["bess", "storage", "battery"])]
+        if not storage_cost_row.empty:
+            storage_cost_row = storage_cost_row.iloc[0]
+            for col in [
+                "capital_cost",
+                "marginal_cost",
+                "max_hours",
+                "efficiency_store",
+                "efficiency_dispatch",
+                "standing_loss",
+            ]:
+                if col in storage_cost_row.index:
+                    if col not in storage_output.columns:
+                        storage_output[col] = np.nan
+                    storage_output[col] = storage_output[col].fillna(storage_cost_row[col])
+
+    return capacity_output, storage_output
+
+
+def _get_technology_attribute(
+    costs_df: Optional[pd.DataFrame],
+    technology: str,
+    column: str,
+    default: float = 0.0,
+) -> float:
+    """Read a technology attribute from costs CSV if available."""
+    if costs_df is None or costs_df.empty or column not in costs_df.columns:
+        return default
+
+    matches = costs_df[costs_df["technology"].astype(str) == str(technology)]
+    if matches.empty:
+        return default
+
+    value = matches.iloc[0][column]
+    return default if pd.isna(value) else float(value)
+
+
+def _co2_cap_for_year(co2_cap_tons, year: int):
+    """Resolve CO2 cap for a given year from a scalar or a year-indexed dict."""
+    if co2_cap_tons is None:
+        return None
+    if isinstance(co2_cap_tons, dict):
+        return co2_cap_tons.get(year)
+    return co2_cap_tons
+
+
+def validate_inputs(
+    csv_nodes: str = DEFAULT_PATHS["nodes_csv"],
+    csv_capacity: str = DEFAULT_PATHS["capacity_csv"],
+    csv_storage: str = DEFAULT_PATHS["storage_csv"],
+    csv_hydrogen: str = DEFAULT_PATHS["hydrogen_csv"],
+    csv_interlinks: str = DEFAULT_PATHS["interlinks_csv"],
+    csv_costs: str = DEFAULT_PATHS["costs_csv"],
+    enable_hydrogen: bool = True,
+    strict: bool = True,
+) -> dict:
+    """
+    Validate input CSV files for consistency and completeness.
+
+    Parameters
+    ----------
+    csv_nodes : str
+        Path to nodes CSV
+    csv_capacity : str
+        Path to generators capacity CSV
+    csv_storage : str
+        Path to storage capacity CSV
+    csv_hydrogen : str
+        Path to optional hydrogen assets CSV
+    csv_interlinks : str
+        Path to interlinks CSV
+    csv_costs : str
+        Path to costs CSV
+    enable_hydrogen : bool
+        If False, skip validation of optional hydrogen assets inputs.
+    strict : bool
+        If True, raise errors on validation failures. If False, return warnings only.
+
+    Returns
+    -------
+    dict
+        Validation report with keys: 'valid', 'errors', 'warnings'
+    """
+    errors = []
+    warnings = []
+
+    # Check nodes CSV
+    nodes_df = load_nodes_from_csv(csv_nodes)
+    if nodes_df is None:
+        errors.append(f"Nodes CSV not found or empty: {csv_nodes}")
+    else:
+        if nodes_df.empty:
+            errors.append("Nodes CSV has no enabled nodes")
+        
+        if {"lat", "lon"}.issubset(nodes_df.columns):
+            missing_coords = nodes_df[["lat", "lon"]].isna().any(axis=1)
+            if missing_coords.any():
+                warnings.append(
+                    f"Some nodes have missing lat/lon coordinates: "
+                    f"{nodes_df.loc[missing_coords, 'zone'].tolist()}"
+                )
+        else:
+            warnings.append("Nodes CSV missing lat/lon columns - VRE profiles cannot be generated from cutout")
+
+        zones = set(nodes_df["zone"].astype(str))
+    
+        # Check capacity CSV
+        capacity_df = load_generator_capacity_from_csv(csv_capacity)
+        if capacity_df is not None:
+            capacity_zones = set(capacity_df["zone"].astype(str))
+            extra_zones = capacity_zones - zones
+            if extra_zones:
+                warnings.append(
+                    f"Generators CSV references zones not in nodes CSV: {sorted(extra_zones)}"
+                )
+            
+            missing_cols = []
+            for col in ["capital_cost", "marginal_cost", "efficiency"]:
+                if col not in capacity_df.columns:
+                    missing_cols.append(col)
+            if missing_cols:
+                warnings.append(
+                    f"Generators CSV missing recommended columns: {missing_cols} "
+                    "(will use defaults or costs CSV)"
+                )
+        else:
+            warnings.append(f"Generators capacity CSV not found: {csv_capacity}")
+
+        # Check storage CSV
+        storage_df = load_storage_capacity_from_csv(csv_storage)
+        if storage_df is not None:
+            storage_zones = set(storage_df["zone"].astype(str))
+            extra_zones = storage_zones - zones
+            if extra_zones:
+                warnings.append(
+                    f"Storage CSV references zones not in nodes CSV: {sorted(extra_zones)}"
+                )
+        else:
+            warnings.append(f"Storage capacity CSV not found: {csv_storage}")
+
+        # Check interlinks CSV
+        interlinks = load_interlinks_from_csv(csv_interlinks)
+        if interlinks:
+            for link in interlinks:
+                if str(link["from_zone"]) not in zones:
+                    warnings.append(f"Interlink from_zone not in nodes: {link['from_zone']}")
+                if str(link["to_zone"]) not in zones:
+                    warnings.append(f"Interlink to_zone not in nodes: {link['to_zone']}")
+
+        # Check optional hydrogen assets CSV
+        if enable_hydrogen:
+            hydrogen_df = load_hydrogen_assets_from_csv(csv_hydrogen)
+            if hydrogen_df is not None:
+                hydrogen_zones = set(hydrogen_df["zone"].astype(str))
+                extra_zones = hydrogen_zones - zones
+                if extra_zones:
+                    warnings.append(
+                        f"Hydrogen CSV references zones not in nodes CSV: {sorted(extra_zones)}"
+                    )
+
+                supported_assets = {
+                    "electrolyzer",
+                    "h2_fuel_cell",
+                    "h2_turbine",
+                    "h2_store_tank",
+                    "h2_tank",
+                    "tank",
+                    "uhs_injection",
+                    "uhs_withdrawal",
+                    "uhs_store",
+                    "uhs",
+                    "h2_uhs",
+                    "h2_store_uhs",
+                }
+                unknown_assets = set(hydrogen_df["asset_type"].astype(str)) - supported_assets
+                if unknown_assets:
+                    warnings.append(
+                        f"Hydrogen CSV includes unsupported asset_type values: {sorted(unknown_assets)}"
+                    )
+            else:
+                warnings.append(f"Hydrogen assets CSV not found: {csv_hydrogen} (optional)")
+
+        # Check costs CSV
+        costs_df = load_technology_costs_from_csv(csv_costs)
+        if costs_df is None:
+            warnings.append(f"Costs CSV not found: {csv_costs} (optional, but recommended)")
+
+    # Report
+    valid = len(errors) == 0
+    report = {
+        "valid": valid,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+    # Print report
+    print("\n" + "=" * 60)
+    print("INPUT VALIDATION REPORT")
+    print("=" * 60)
+    
+    if errors:
+        print(f"\n❌ ERRORS ({len(errors)}):")
+        for err in errors:
+            print(f"  - {err}")
+    
+    if warnings:
+        print(f"\n⚠️  WARNINGS ({len(warnings)}):")
+        for warn in warnings:
+            print(f"  - {warn}")
+    
+    if not errors and not warnings:
+        print("\n✓ All inputs valid")
+    elif not errors:
+        print("\n✓ No critical errors (warnings only)")
+    
+    print("=" * 60 + "\n")
+
+    if strict and errors:
+        raise ValueError(f"Input validation failed with {len(errors)} error(s)")
+
+    return report
+
+
+def build_snapshots(year: int = 2030) -> pd.DatetimeIndex:
+    """Generate hourly snapshots for a full year (8760 or 8784 if leap year)."""
+    snapshots = pd.date_range(f"{year}-01-01 00:00", f"{year}-12-31 23:00", freq="h")
+    is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+    expected_hours = 8784 if is_leap else 8760
+    assert len(snapshots) == expected_hours, f"Expected {expected_hours} hours, got {len(snapshots)}"
+    return snapshots
+
+
+def _derive_cutout_bounds(
+    nodes_df: Optional[pd.DataFrame],
+    bounds: Optional[Tuple[float, float, float, float]],
+    padding_deg: float = 1.0,
+) -> Tuple[float, float, float, float]:
+    """Return cutout bounds as lon_min, lon_max, lat_min, lat_max."""
+    if bounds is not None:
+        return bounds
+
+    if nodes_df is not None and {"lat", "lon"}.issubset(nodes_df.columns):
+        coords = nodes_df[["lat", "lon"]].dropna()
+        if not coords.empty:
+            lon_min = float(coords["lon"].min()) - padding_deg
+            lon_max = float(coords["lon"].max()) + padding_deg
+            lat_min = float(coords["lat"].min()) - padding_deg
+            lat_max = float(coords["lat"].max()) + padding_deg
+            return lon_min, lon_max, lat_min, lat_max
+
+    # Legacy fallback bounds (Magallanes).
+    return -76.0, -66.0, -56.0, -50.0
+
+
+def get_case_cutout(
+    year: int = 2019,
+    force_prepare: bool = False,
+    base_dir: str = "data",
+    case_name: str = "case",
+    cutout_file: Optional[str] = None,
+    bounds: Optional[Tuple[float, float, float, float]] = None,
+    nodes_df: Optional[pd.DataFrame] = None,
+    dx: float = 0.25,
+    dy: float = 0.25,
+):
+    """Get or prepare ERA5 cutout for an arbitrary case study."""
+    try:
+        import atlite
+    except ImportError as exc:
+        raise ImportError("atlite is required. Install with: pip install atlite") from exc
+
+    lon_min, lon_max, lat_min, lat_max = _derive_cutout_bounds(nodes_df, bounds)
+
+    project_root = Path(__file__).resolve().parent
+    output_dir = (project_root / base_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if cutout_file is None:
+        cutout_path = output_dir / f"{case_name}_{year}.nc"
+    else:
+        cutout_candidate = Path(cutout_file)
+        cutout_path = cutout_candidate if cutout_candidate.is_absolute() else output_dir / cutout_candidate
+        cutout_path.parent.mkdir(parents=True, exist_ok=True)
+    cutout_path = cutout_path.resolve()
+
+    cutout = atlite.Cutout(
+        path=cutout_path,
+        module="era5",
+        x=slice(lon_min, lon_max),
+        y=slice(lat_min, lat_max),
+        time=slice(f"{year}-01-01 00:00", f"{year}-12-31 23:00"),
+        dx=dx,
+        dy=dy,
+    )
+
+    if force_prepare or not cutout_path.exists():
+        cutout.prepare()
+
+    return cutout
+
+
+def _get_vre_profiles_simple(
+    cutout,
+    nodes_df: pd.DataFrame,
+    default_wind_cf: float = 0.4,
+    default_solar_cf: float = 0.15,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build hourly wind and solar capacity factor profiles for each node.
+
+    Nodes must include latitude/longitude coordinates (`lat`, `lon`).
+    """
+    import xarray as xr
+
+    _require_columns(nodes_df, ["zone", "lat", "lon"], Path("nodes_df"))
+
+    ds = xr.open_dataset(cutout.path)
+    time_index = pd.to_datetime(ds["time"].values)
+    wind_cf = pd.DataFrame(index=time_index)
+    solar_cf = pd.DataFrame(index=time_index)
+
+    for _, row in nodes_df.iterrows():
+        zone = row["zone"]
+        lat = float(row["lat"])
+        lon = float(row["lon"])
+
+        try:
+            wnd_ts = ds["wnd100m"].sel(y=lat, x=lon, method="nearest").values
+            wnd_cf_ts = np.zeros_like(wnd_ts)
+
+            mask_partial = (wnd_ts >= 4) & (wnd_ts < 13)
+            mask_rated = wnd_ts >= 13
+
+            wnd_cf_ts[mask_partial] = ((wnd_ts[mask_partial] - 4) / 9) ** 2
+            wnd_cf_ts[mask_rated] = 1.0
+            wnd_cf_ts[wnd_ts >= 25] = 0.0
+
+            wind_cf[zone] = wnd_cf_ts
+        except Exception:
+            wind_cf[zone] = default_wind_cf
+
+        try:
+            direct_ts = ds["influx_direct"].sel(y=lat, x=lon, method="nearest").values
+            diffuse_ts = ds["influx_diffuse"].sel(y=lat, x=lon, method="nearest").values
+            solar_cf_ts = ((direct_ts + diffuse_ts) / 1000.0).clip(0, 1)
+            solar_cf[zone] = solar_cf_ts
+        except Exception:
+            solar_cf[zone] = default_solar_cf
+
+    ds.close()
+
+    return wind_cf.clip(0, 1), solar_cf.clip(0, 1)
+
+
+def _series_from_atlite_output(output, expected_len: int) -> np.ndarray:
+    """Convert atlite output to a 1D timeseries with robust shape handling."""
+    values = np.asarray(output).squeeze()
+
+    if values.ndim == 0:
+        return np.repeat(float(values), expected_len)
+
+    if values.ndim == 1 and len(values) == expected_len:
+        return values
+
+    # Fallback for extra dimensions (e.g. singleton spatial dimensions).
+    flat = values.reshape(expected_len, -1)
+    return flat.mean(axis=1)
+
+
+def _get_vre_profiles_atlite_technology(
+    cutout,
+    nodes_df: pd.DataFrame,
+    default_wind_cf: float = 0.4,
+    default_solar_cf: float = 0.15,
+    wind_turbine: str = "Vestas_V112_3MW",
+    solar_panel: str = "CSi",
+    solar_orientation: str = "latitude_optimal",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Build VRE profiles with atlite technological conversion (wind/pv)."""
+    import xarray as xr
+
+    _require_columns(nodes_df, ["zone", "lat", "lon"], Path("nodes_df"))
+
+    ds = xr.open_dataset(cutout.path)
+    time_index = pd.to_datetime(ds["time"].values)
+    ds.close()
+
+    wind_cf = pd.DataFrame(index=time_index)
+    solar_cf = pd.DataFrame(index=time_index)
+
+    x_coords = ds["x"].values
+    y_coords = ds["y"].values
+
+    def _build_point_layout(lon: float, lat: float) -> xr.DataArray:
+        x_near = float(x_coords[np.argmin(np.abs(x_coords - lon))])
+        y_near = float(y_coords[np.argmin(np.abs(y_coords - lat))])
+
+        layout = xr.DataArray(
+            np.zeros((len(y_coords), len(x_coords))),
+            coords={"y": y_coords, "x": x_coords},
+            dims=("y", "x"),
+        )
+        layout.loc[dict(y=y_near, x=x_near)] = 1.0
+        return layout
+
+    for _, row in nodes_df.iterrows():
+        zone = row["zone"]
+        lat = float(row["lat"])
+        lon = float(row["lon"])
+        point_layout = _build_point_layout(lon, lat)
+
+        try:
+            wind_output = cutout.wind(
+                turbine=wind_turbine,
+                layout=point_layout,
+                per_unit=True,
+            )
+            wind_cf[zone] = _series_from_atlite_output(wind_output, len(time_index))
+        except Exception:
+            wind_cf[zone] = default_wind_cf
+
+        try:
+            solar_output = cutout.pv(
+                panel=solar_panel,
+                orientation=solar_orientation,
+                layout=point_layout,
+                per_unit=True,
+            )
+            solar_cf[zone] = _series_from_atlite_output(solar_output, len(time_index))
+        except Exception:
+            solar_cf[zone] = default_solar_cf
+
+    return wind_cf.clip(0, 1), solar_cf.clip(0, 1)
+
+
+def get_vre_profiles_from_cutout(
+    cutout,
+    nodes_df: pd.DataFrame,
+    default_wind_cf: float = 0.4,
+    default_solar_cf: float = 0.15,
+    method: str = "simple",
+    wind_turbine: str = "Vestas_V112_3MW",
+    solar_panel: str = "CSi",
+    solar_orientation: str = "latitude_optimal",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build hourly wind/solar capacity factors using selected method.
+
+    method:
+    - "simple": direct meteorological proxy from cutout variables.
+    - "atlite_technology": atlite wind/pv conversion using technology assumptions.
+    """
+    method_normalized = str(method).strip().lower()
+
+    if method_normalized == "simple":
+        return _get_vre_profiles_simple(cutout, nodes_df, default_wind_cf, default_solar_cf)
+
+    if method_normalized == "atlite_technology":
+        try:
+            return _get_vre_profiles_atlite_technology(
+                cutout=cutout,
+                nodes_df=nodes_df,
+                default_wind_cf=default_wind_cf,
+                default_solar_cf=default_solar_cf,
+                wind_turbine=wind_turbine,
+                solar_panel=solar_panel,
+                solar_orientation=solar_orientation,
+            )
+        except Exception as exc:
+            print(
+                f"Warning: atlite_technology VRE profiles failed ({exc}). Falling back to simple method."
+            )
+            return _get_vre_profiles_simple(cutout, nodes_df, default_wind_cf, default_solar_cf)
+
+    raise ValueError(f"Unknown VRE profile method: {method}. Use 'simple' or 'atlite_technology'.")
+
+
+def map_weather_year(df_weather: pd.DataFrame, target_year: int = 2030) -> pd.DataFrame:
+    """Map historical hourly weather profiles to target year, handling leap years."""
+    hours = len(df_weather)
+    if hours not in (8760, 8784):
+        raise ValueError(f"Weather profile must have 8760/8784 rows, got {hours}")
+
+    new_index = pd.date_range(f"{target_year}-01-01 00:00", f"{target_year}-12-31 23:00", freq="h")
+    is_target_leap = len(new_index) == 8784
+
+    df_mapped = df_weather.copy().reset_index(drop=True)
+
+    if len(df_mapped) == 8760 and is_target_leap:
+        feb28_idx = 24 * (31 + 27)
+        feb28_data = df_mapped.iloc[feb28_idx : feb28_idx + 24].copy()
+        df_mapped = pd.concat(
+            [df_mapped.iloc[: feb28_idx + 24], feb28_data, df_mapped.iloc[feb28_idx + 24 :]],
+            ignore_index=True,
+        )
+    elif len(df_mapped) == 8784 and not is_target_leap:
+        # Remove Feb 29 from leap-year weather when target year is not leap.
+        feb29_start = 24 * (31 + 28)
+        df_mapped = pd.concat(
+            [df_mapped.iloc[:feb29_start], df_mapped.iloc[feb29_start + 24 :]],
+            ignore_index=True,
+        )
+
+    if len(df_mapped) != len(new_index):
+        raise ValueError(f"Mapped weather length mismatch: {len(df_mapped)} vs {len(new_index)}")
+
+    df_mapped.index = new_index
+    return df_mapped
+
+
+def _safe_float(value, default: float) -> float:
+    return default if pd.isna(value) else float(value)
+
+
+def _previous_nominal_capacity(previous_year_network, component: str, asset_id: str, default: float) -> float:
+    """Read previous optimized capacity if available, then fallback to nominal capacity."""
+    table = getattr(previous_year_network, component)
+    if asset_id not in table.index:
+        return default
+
+    if "p_nom_opt" in table.columns and pd.notna(table.loc[asset_id, "p_nom_opt"]):
+        return float(table.loc[asset_id, "p_nom_opt"])
+
+    return float(table.loc[asset_id, "p_nom"])
+
+
+def _previous_store_energy_capacity(previous_year_network, asset_id: str, default: float) -> float:
+    """Read previous optimized store energy capacity if available."""
+    table = previous_year_network.stores
+    if asset_id not in table.index:
+        return default
+
+    if "e_nom_opt" in table.columns and pd.notna(table.loc[asset_id, "e_nom_opt"]):
+        return float(table.loc[asset_id, "e_nom_opt"])
+
+    return float(table.loc[asset_id, "e_nom"])
+
+
+def build_case_network(
+    snapshots: pd.DatetimeIndex,
+    nodes_df: pd.DataFrame,
+    load: pd.DataFrame,
+    heat_load: Optional[pd.DataFrame] = None,
+    interlinks: Optional[list] = None,
+    capacity_df: Optional[pd.DataFrame] = None,
+    storage_df: Optional[pd.DataFrame] = None,
+    hydrogen_df: Optional[pd.DataFrame] = None,
+    hydrogen_demand: Optional[pd.DataFrame] = None,
+    vre_profiles: Optional[Dict[str, pd.DataFrame]] = None,
+    year: Optional[int] = None,
+    previous_year_network=None,
+    co2_cap_tons: Optional[float] = None,
+    costs_overrides: Optional[dict] = None,
+    general_settings: Optional[dict] = None,
+    enable_hydrogen: bool = True,
+    slack_cost_per_mwh: Optional[float] = None,
+    csv_interlinks: str = DEFAULT_PATHS["interlinks_csv"],
+    csv_capacity: str = DEFAULT_PATHS["capacity_csv"],
+    csv_storage: str = DEFAULT_PATHS["storage_csv"],
+    csv_hydrogen: str = DEFAULT_PATHS["hydrogen_csv"],
+    csv_costs: str = DEFAULT_PATHS["costs_csv"],
+):
+    """Build a multi-node PyPSA electricity network from CSV-driven inputs."""
+    n = pypsa.Network()
+    n.set_snapshots(snapshots)
+    model_year = int(year) if year is not None else int(snapshots[0].year)
+    slack_cost_per_mwh = _resolve_slack_cost(slack_cost_per_mwh, general_settings=None, default=500.0)
+
+    _require_columns(nodes_df, ["zone"], Path("nodes_df"))
+    zones = nodes_df["zone"].astype(str).tolist()
+
+    if capacity_df is None:
+        capacity_df = load_generator_capacity_from_csv(csv_capacity)
+    if storage_df is None:
+        storage_df = load_storage_capacity_from_csv(csv_storage)
+    if hydrogen_df is None and enable_hydrogen:
+        hydrogen_df = load_hydrogen_assets_from_csv(csv_hydrogen)
+    if not enable_hydrogen:
+        hydrogen_df = None
+
+    costs_df = load_technology_costs_from_csv(csv_costs)
+    costs_df = _project_costs_for_year(costs_df, model_year)
+    capacity_df, storage_df = _apply_cost_defaults(capacity_df, storage_df, costs_df)
+
+    default_costs = {
+        "wind_capital": 1200,
+        "solar_capital": 650,
+        "ocgt_marginal": 140,
+        "ocgt_eff": 0.38,
+        "bess_capital": 75000,
+        "bess_marginal": 0,
+        "bess_max_hours": 4,
+        "bess_eff_store": 0.95,
+        "bess_eff_dispatch": 0.95,
+        "bess_standing_loss": 0.001,
+        "electrolyzer_capital": 90000,
+        "electrolyzer_marginal": 0,
+        "electrolyzer_eff": 0.70,
+        "h2_fuel_cell_capital": 100000,
+        "h2_fuel_cell_marginal": 0,
+        "h2_fuel_cell_eff": 0.55,
+        "h2_turbine_capital": 85000,
+        "h2_turbine_marginal": 0,
+        "h2_turbine_eff": 0.45,
+        "h2_tank_capital": 2500,
+        "h2_tank_marginal": 0,
+        "h2_tank_standing_loss": 0.0005,
+        "uhs_injection_capital": 20000,
+        "uhs_injection_marginal": 0,
+        "uhs_injection_eff": 0.98,
+        "uhs_withdrawal_capital": 25000,
+        "uhs_withdrawal_marginal": 0,
+        "uhs_withdrawal_eff": 0.98,
+        "uhs_storage_capital": 1200,
+        "uhs_storage_marginal": 0,
+        "uhs_storage_standing_loss": 0.0001,
+        "natural_gas_marginal": 45.0,
+        "gas_boiler_eff": 0.90,
+        "gas_boiler_capital": 0.0,
+        "gas_boiler_marginal": 0.0,
+        "heat_pump_cop": 3.0,
+        "heat_pump_capital": 65000.0,
+        "heat_pump_marginal": 0.0,
+    }
+    if costs_overrides is not None:
+        default_costs.update(costs_overrides)
+
+    carriers = {"electricity", "bess", "slack"}
+    if heat_load is not None and not heat_load.empty:
+        carriers.update({"heat", "natural_gas", "gas_boiler", "heat_pump"})
+    if enable_hydrogen:
+        carriers.update(
+            {
+                "hydrogen",
+                "hydrogen_storage",
+                "electrolyzer",
+                "h2_fuel_cell",
+                "h2_turbine",
+                "uhs_injection",
+                "uhs_withdrawal",
+                "uhs_storage",
+            }
+        )
+    if capacity_df is not None and "generator" in capacity_df.columns:
+        carriers.update(capacity_df["generator"].astype(str).unique().tolist())
+    else:
+        carriers.update(["wind", "solar", "ocgt"])
+
+    for carrier in sorted(carriers):
+        n.add("Carrier", carrier)
+
+    for carrier in sorted(carriers):
+        default_co2 = 0.202 if carrier == "natural_gas" else 0.0
+        n.carriers.loc[carrier, "co2_emissions"] = _get_technology_attribute(
+            costs_df,
+            carrier,
+            "co2_emissions",
+            default=default_co2,
+        )
+
+    heat_zones = set(heat_load.columns.astype(str).tolist()) if heat_load is not None and not heat_load.empty else set()
+    nodes_lookup = nodes_df.set_index("zone", drop=False)
+
+    hydrogen_zones = set()
+    if enable_hydrogen:
+        if hydrogen_df is not None and not hydrogen_df.empty and "zone" in hydrogen_df.columns:
+            hydrogen_zones.update(hydrogen_df["zone"].astype(str).tolist())
+        if hydrogen_demand is not None:
+            hydrogen_zones.update([str(z) for z in hydrogen_demand.columns if str(z) in zones])
+
+    for z in zones:
+        if z not in load.columns:
+            raise ValueError(f"Load is missing zone column: {z}")
+        n.add("Bus", f"elec_{z}", carrier="electricity")
+        if z in heat_zones:
+            n.add("Bus", f"heat_{z}", carrier="heat")
+            n.add("Bus", f"gas_{z}", carrier="natural_gas")
+        if enable_hydrogen and z in hydrogen_zones:
+            n.add("Bus", f"h2_{z}", carrier="hydrogen")
+        n.add("Load", f"load_{z}", bus=f"elec_{z}", p_set=load[z].values)
+
+        if z in heat_zones:
+            zone_row = nodes_lookup.loc[z]
+            n.add("Load", f"heat_load_{z}", bus=f"heat_{z}", p_set=heat_load[z].values)
+
+            # Existing natural gas supply chain for heat demand.
+            gas_marginal = _safe_float(
+                zone_row.get("natural_gas_marginal_cost", np.nan),
+                _get_technology_attribute(costs_df, "natural_gas", "marginal_cost", default_costs["natural_gas_marginal"]),
+            )
+            n.add(
+                "Generator",
+                f"gas_supply_{z}",
+                bus=f"gas_{z}",
+                carrier="natural_gas",
+                p_nom=1e6,
+                marginal_cost=gas_marginal,
+            )
+
+            gas_boiler_eff = _safe_float(
+                zone_row.get("gas_boiler_efficiency", np.nan),
+                _get_technology_attribute(costs_df, "gas_boiler", "efficiency", default_costs["gas_boiler_eff"]),
+            )
+            gas_boiler_capital = _safe_float(
+                zone_row.get("gas_boiler_capital_cost", np.nan),
+                _get_technology_attribute(costs_df, "gas_boiler", "capital_cost", default_costs["gas_boiler_capital"]),
+            )
+            gas_boiler_marginal = _safe_float(
+                zone_row.get("gas_boiler_marginal_cost", np.nan),
+                _get_technology_attribute(costs_df, "gas_boiler", "marginal_cost", default_costs["gas_boiler_marginal"]),
+            )
+            existing_gas_boiler_mw = _safe_float(
+                zone_row.get("existing_gas_boiler_mw", np.nan),
+                float(heat_load[z].max()) * 1.25,
+            )
+            n.add(
+                "Link",
+                f"gas_boiler_{z}",
+                bus0=f"gas_{z}",
+                bus1=f"heat_{z}",
+                carrier="gas_boiler",
+                p_nom=max(0.0, existing_gas_boiler_mw),
+                p_nom_extendable=False,
+                efficiency=gas_boiler_eff,
+                capital_cost=gas_boiler_capital,
+                marginal_cost=gas_boiler_marginal,
+            )
+
+            # Heat pump is the electrification option for heat decarbonization.
+            allow_heat_pump_raw = zone_row.get("allow_heat_pump", True)
+            allow_heat_pump = str(allow_heat_pump_raw).strip().lower() not in {"false", "0", "no", "n"}
+            hp_available_from_year = int(_safe_float(zone_row.get("heat_pump_available_from_year", model_year), model_year))
+            hp_expansion_allowed = allow_heat_pump and model_year >= hp_available_from_year
+            installed_hp_mw = _safe_float(zone_row.get("installed_heat_pump_mw", 0.0), 0.0)
+            hp_cop = _safe_float(
+                zone_row.get("heat_pump_cop", np.nan),
+                _get_technology_attribute(costs_df, "heat_pump", "efficiency", default_costs["heat_pump_cop"]),
+            )
+            hp_capital = _safe_float(
+                zone_row.get("heat_pump_capital_cost", np.nan),
+                _get_technology_attribute(costs_df, "heat_pump", "capital_cost", default_costs["heat_pump_capital"]),
+            )
+            hp_marginal = _safe_float(
+                zone_row.get("heat_pump_marginal_cost", np.nan),
+                _get_technology_attribute(costs_df, "heat_pump", "marginal_cost", default_costs["heat_pump_marginal"]),
+            )
+
+            hp_id = f"heat_pump_{z}"
+            hp_p_nom_min = installed_hp_mw
+            if hp_expansion_allowed and previous_year_network is not None and hp_id in previous_year_network.links.index:
+                prev_cap = _previous_nominal_capacity(previous_year_network, "links", hp_id, installed_hp_mw)
+                hp_p_nom_min = max(installed_hp_mw, prev_cap)
+
+            n.add(
+                "Link",
+                hp_id,
+                bus0=f"elec_{z}",
+                bus1=f"heat_{z}",
+                carrier="heat_pump",
+                p_nom=installed_hp_mw,
+                p_nom_min=hp_p_nom_min,
+                p_nom_extendable=hp_expansion_allowed,
+                p_nom_max=installed_hp_mw if not hp_expansion_allowed else np.nan,
+                efficiency=hp_cop,
+                capital_cost=hp_capital,
+                marginal_cost=hp_marginal,
+            )
+
+            if hp_expansion_allowed and previous_year_network is not None and hp_id in previous_year_network.links.index:
+                prev_cap = _previous_nominal_capacity(previous_year_network, "links", hp_id, installed_hp_mw)
+                if prev_cap > 0:
+                    n.links.loc[hp_id, "p_nom_max"] = max(installed_hp_mw, prev_cap * 1.5)
+
+        # Add slack generator for demand not supplied (penalty cost in USD/MWh)
+        n.add(
+            "Generator",
+            f"slack_{z}",
+            bus=f"elec_{z}",
+            carrier="slack",
+            p_nom=1e6,  # effectively unlimited
+            marginal_cost=slack_cost_per_mwh,
+        )
+
+    if enable_hydrogen and hydrogen_demand is not None:
+        if not isinstance(hydrogen_demand.index, pd.DatetimeIndex):
+            raise ValueError("hydrogen_demand index must be a DatetimeIndex matching snapshots")
+        if not hydrogen_demand.index.equals(snapshots):
+            raise ValueError("hydrogen_demand index must match network snapshots exactly")
+
+        missing_h2_cols = [z for z in zones if z not in hydrogen_demand.columns]
+        if missing_h2_cols:
+            raise ValueError(
+                "hydrogen_demand is missing zone columns: "
+                f"{missing_h2_cols}"
+            )
+
+        for z in zones:
+            n.add(
+                "Load",
+                f"h2_demand_{z}",
+                bus=f"h2_{z}",
+                p_set=hydrogen_demand[z].values,
+            )
+
+    if interlinks is None:
+        interlinks = load_interlinks_from_csv(csv_interlinks)
+
+    if interlinks is None:
+        interlinks = []
+
+    zone_set = set(zones)
+    for link_dict in interlinks:
+        from_zone = str(link_dict["from_zone"])
+        to_zone = str(link_dict["to_zone"])
+        if from_zone not in zone_set or to_zone not in zone_set:
+            continue
+
+        cap_mw = float(link_dict["capacity_mw"])
+        loss = _safe_float(link_dict.get("loss_fraction", 0), 0.0)
+
+        n.add(
+            "Link",
+            f"link_{from_zone}_to_{to_zone}",
+            bus0=f"elec_{from_zone}",
+            bus1=f"elec_{to_zone}",
+            p_nom=cap_mw,
+            p_nom_extendable=False,
+            efficiency=1 - loss,
+            carrier="electricity",
+        )
+
+    if capacity_df is not None:
+        for _, row in capacity_df.iterrows():
+            zone = str(row["zone"])
+            if zone not in zone_set:
+                continue
+
+            gen_name = str(row["generator"])
+            installed_cap = _safe_float(row.get("installed_capacity", 0), 0.0)
+            capital_cost = _safe_float(row.get("capital_cost", np.nan), 0.0)
+            marginal_cost = _safe_float(row.get("marginal_cost", np.nan), 0.0)
+            efficiency = _safe_float(row.get("efficiency", np.nan), 1.0)
+            p_min_mw = _safe_float(row.get("p_min_mw", 0), 0.0)
+            available_from_year = int(_safe_float(row.get("available_from_year", model_year), model_year))
+            expansion_allowed = model_year >= available_from_year
+            gen_id = f"{gen_name}_{zone}"
+            use_unit_commitment = p_min_mw > 0 and installed_cap > 0
+
+            linked_p_nom_min = installed_cap
+            if (
+                expansion_allowed
+                and previous_year_network is not None
+                and gen_id in previous_year_network.generators.index
+            ):
+                prev_cap = _previous_nominal_capacity(previous_year_network, "generators", gen_id, installed_cap)
+                linked_p_nom_min = max(installed_cap, prev_cap)
+
+            attrs = {
+                "bus": f"elec_{zone}",
+                "carrier": gen_name,
+                "p_nom": installed_cap,
+                "p_nom_min": linked_p_nom_min,
+                "p_nom_extendable": expansion_allowed and not use_unit_commitment,
+                "capital_cost": capital_cost,
+                "marginal_cost": marginal_cost,
+            }
+
+            if not expansion_allowed:
+                attrs["p_nom_max"] = installed_cap
+
+            if efficiency != 1.0:
+                attrs["efficiency"] = efficiency
+
+            if p_min_mw > 0 and installed_cap > 0:
+                attrs["p_min_pu"] = min(1.0, p_min_mw / installed_cap)
+
+            if use_unit_commitment:
+                # Enable on/off operation with minimum output only when unit is on.
+                attrs["committable"] = True
+                attrs["p_nom_extendable"] = False
+                attrs["p_nom_min"] = installed_cap
+                attrs["p_nom_max"] = installed_cap
+
+            if vre_profiles is not None and gen_name in vre_profiles and zone in vre_profiles[gen_name].columns:
+                attrs["p_max_pu"] = vre_profiles[gen_name][zone].values
+
+            n.add("Generator", gen_id, **attrs)
+
+            if (
+                expansion_allowed
+                and previous_year_network is not None
+                and gen_id in previous_year_network.generators.index
+            ):
+                prev_cap = _previous_nominal_capacity(previous_year_network, "generators", gen_id, installed_cap)
+                if prev_cap > 0:
+                    n.generators.loc[gen_id, "p_nom_max"] = max(installed_cap, prev_cap * 1.5)
+    else:
+        for z in zones:
+            if vre_profiles is not None and "wind" in vre_profiles and z in vre_profiles["wind"].columns:
+                n.add(
+                    "Generator",
+                    f"wind_{z}",
+                    bus=f"elec_{z}",
+                    carrier="wind",
+                    p_nom_extendable=True,
+                    p_max_pu=vre_profiles["wind"][z].values,
+                    capital_cost=default_costs["wind_capital"],
+                    marginal_cost=0.0,
+                )
+
+            if vre_profiles is not None and "solar" in vre_profiles and z in vre_profiles["solar"].columns:
+                n.add(
+                    "Generator",
+                    f"solar_{z}",
+                    bus=f"elec_{z}",
+                    carrier="solar",
+                    p_nom_extendable=True,
+                    p_max_pu=vre_profiles["solar"][z].values,
+                    capital_cost=default_costs["solar_capital"],
+                    marginal_cost=0.0,
+                )
+
+            n.add(
+                "Generator",
+                f"ocgt_{z}",
+                bus=f"elec_{z}",
+                carrier="ocgt",
+                p_nom_extendable=True,
+                efficiency=default_costs["ocgt_eff"],
+                marginal_cost=default_costs["ocgt_marginal"],
+            )
+
+    if storage_df is not None:
+        for _, row in storage_df.iterrows():
+            zone = str(row["zone"])
+            if zone not in zone_set:
+                continue
+
+            storage_id = f"bess_{zone}"
+            installed_power_mw = _safe_float(row.get("installed_power_mw", 0), 0.0)
+            max_hours = _safe_float(row.get("max_hours", np.nan), default_costs["bess_max_hours"])
+            capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["bess_capital"])
+            marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["bess_marginal"])
+            efficiency_store = _safe_float(
+                row.get("efficiency_store", np.nan), default_costs["bess_eff_store"]
+            )
+            efficiency_dispatch = _safe_float(
+                row.get("efficiency_dispatch", np.nan), default_costs["bess_eff_dispatch"]
+            )
+            standing_loss = _safe_float(
+                row.get("standing_loss", np.nan), default_costs["bess_standing_loss"]
+            )
+            available_from_year = int(_safe_float(row.get("available_from_year", model_year), model_year))
+            expansion_allowed = model_year >= available_from_year
+
+            p_nom_min = installed_power_mw
+            if previous_year_network is not None and storage_id in previous_year_network.storage_units.index:
+                prev_power = _previous_nominal_capacity(
+                    previous_year_network,
+                    "storage_units",
+                    storage_id,
+                    installed_power_mw,
+                )
+                p_nom_min = max(p_nom_min, prev_power)
+
+            n.add(
+                "StorageUnit",
+                storage_id,
+                bus=f"elec_{zone}",
+                carrier="bess",
+                p_nom=installed_power_mw,
+                p_nom_min=p_nom_min,
+                p_nom_extendable=expansion_allowed,
+                max_hours=max_hours,
+                capital_cost=capital_cost,
+                marginal_cost=marginal_cost,
+                efficiency_store=efficiency_store,
+                efficiency_dispatch=efficiency_dispatch,
+                standing_loss=standing_loss,
+            )
+
+            if not expansion_allowed:
+                n.storage_units.loc[storage_id, "p_nom_max"] = installed_power_mw
+
+            if (
+                expansion_allowed
+                and previous_year_network is not None
+                and storage_id in previous_year_network.storage_units.index
+            ):
+                prev_power = _previous_nominal_capacity(
+                    previous_year_network,
+                    "storage_units",
+                    storage_id,
+                    installed_power_mw,
+                )
+                if prev_power > 0:
+                    n.storage_units.loc[storage_id, "p_nom_max"] = max(installed_power_mw, prev_power * 1.5)
+    else:
+        for z in zones:
+            n.add(
+                "StorageUnit",
+                f"bess_{z}",
+                bus=f"elec_{z}",
+                carrier="bess",
+                p_nom=0.0,
+                p_nom_min=0.0,
+                p_nom_extendable=True,
+                max_hours=default_costs["bess_max_hours"],
+                capital_cost=default_costs["bess_capital"],
+                marginal_cost=default_costs["bess_marginal"],
+                efficiency_store=default_costs["bess_eff_store"],
+                efficiency_dispatch=default_costs["bess_eff_dispatch"],
+                standing_loss=default_costs["bess_standing_loss"],
+            )
+
+    if hydrogen_df is not None and not hydrogen_df.empty:
+        asset_type_alias = {
+            "tank": "h2_store_tank",
+            "h2_tank": "h2_store_tank",
+            "h2_uhs": "uhs",
+            "h2_store_uhs": "uhs",
+        }
+
+        for _, row in hydrogen_df.iterrows():
+            zone = str(row["zone"])
+            if zone not in zone_set:
+                continue
+
+            raw_asset_type = str(row["asset_type"]).strip().lower()
+            asset_type = asset_type_alias.get(raw_asset_type, raw_asset_type)
+            available_from_year = int(_safe_float(row.get("available_from_year", model_year), model_year))
+            expansion_allowed = model_year >= available_from_year
+
+            if asset_type == "electrolyzer":
+                asset_id = f"h2_electrolyzer_{zone}"
+                installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
+                efficiency = _safe_float(row.get("efficiency", np.nan), default_costs["electrolyzer_eff"])
+                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["electrolyzer_capital"])
+                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["electrolyzer_marginal"])
+
+                linked_min = installed_capacity_mw
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
+                    linked_min = max(installed_capacity_mw, prev_cap)
+
+                n.add(
+                    "Link",
+                    asset_id,
+                    bus0=f"elec_{zone}",
+                    bus1=f"h2_{zone}",
+                    carrier="electrolyzer",
+                    p_nom=installed_capacity_mw,
+                    p_nom_min=linked_min,
+                    p_nom_extendable=expansion_allowed,
+                    p_nom_max=installed_capacity_mw if not expansion_allowed else np.nan,
+                    efficiency=efficiency,
+                    capital_cost=capital_cost,
+                    marginal_cost=marginal_cost,
+                )
+
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
+                    if prev_cap > 0:
+                        n.links.loc[asset_id, "p_nom_max"] = max(installed_capacity_mw, prev_cap * 1.5)
+
+            elif asset_type in {"h2_fuel_cell", "h2_turbine"}:
+                asset_id = f"{asset_type}_{zone}"
+                installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
+
+                if asset_type == "h2_fuel_cell":
+                    default_eff = default_costs["h2_fuel_cell_eff"]
+                    default_capital = default_costs["h2_fuel_cell_capital"]
+                    default_marginal = default_costs["h2_fuel_cell_marginal"]
+                else:
+                    default_eff = default_costs["h2_turbine_eff"]
+                    default_capital = default_costs["h2_turbine_capital"]
+                    default_marginal = default_costs["h2_turbine_marginal"]
+
+                efficiency = _safe_float(row.get("efficiency", np.nan), default_eff)
+                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_capital)
+                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_marginal)
+
+                linked_min = installed_capacity_mw
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
+                    linked_min = max(installed_capacity_mw, prev_cap)
+
+                n.add(
+                    "Link",
+                    asset_id,
+                    bus0=f"h2_{zone}",
+                    bus1=f"elec_{zone}",
+                    carrier=asset_type,
+                    p_nom=installed_capacity_mw,
+                    p_nom_min=linked_min,
+                    p_nom_extendable=expansion_allowed,
+                    p_nom_max=installed_capacity_mw if not expansion_allowed else np.nan,
+                    efficiency=efficiency,
+                    capital_cost=capital_cost,
+                    marginal_cost=marginal_cost,
+                )
+
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
+                    if prev_cap > 0:
+                        n.links.loc[asset_id, "p_nom_max"] = max(installed_capacity_mw, prev_cap * 1.5)
+
+            elif asset_type == "h2_store_tank":
+                asset_id = f"h2_store_{zone}"
+                installed_energy_mwh = _safe_float(row.get("installed_energy_mwh", 0.0), 0.0)
+                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["h2_tank_capital"])
+                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["h2_tank_marginal"])
+                standing_loss = _safe_float(row.get("standing_loss", np.nan), default_costs["h2_tank_standing_loss"])
+
+                linked_min = installed_energy_mwh
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.stores.index:
+                    prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_mwh)
+                    linked_min = max(installed_energy_mwh, prev_energy)
+
+                n.add(
+                    "Store",
+                    asset_id,
+                    bus=f"h2_{zone}",
+                    carrier="hydrogen_storage",
+                    e_nom=installed_energy_mwh,
+                    e_nom_min=linked_min,
+                    e_nom_extendable=expansion_allowed,
+                    e_nom_max=installed_energy_mwh if not expansion_allowed else np.nan,
+                    standing_loss=standing_loss,
+                    capital_cost=capital_cost,
+                    marginal_cost=marginal_cost,
+                )
+
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.stores.index:
+                    prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_mwh)
+                    if prev_energy > 0:
+                        n.stores.loc[asset_id, "e_nom_max"] = max(installed_energy_mwh, prev_energy * 1.5)
+
+            elif asset_type == "uhs_injection":
+                uhs_bus_id = f"uhs_{zone}"
+                if uhs_bus_id not in n.buses.index:
+                    n.add("Bus", uhs_bus_id, carrier="uhs_storage")
+
+                asset_id = f"uhs_injection_{zone}"
+                installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
+                efficiency = _safe_float(row.get("efficiency", np.nan), default_costs["uhs_injection_eff"])
+                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_injection_capital"])
+                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_injection_marginal"])
+
+                linked_min = installed_capacity_mw
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
+                    linked_min = max(installed_capacity_mw, prev_cap)
+
+                n.add(
+                    "Link",
+                    asset_id,
+                    bus0=f"h2_{zone}",
+                    bus1=uhs_bus_id,
+                    carrier="uhs_injection",
+                    p_nom=installed_capacity_mw,
+                    p_nom_min=linked_min,
+                    p_nom_extendable=expansion_allowed,
+                    p_nom_max=installed_capacity_mw if not expansion_allowed else np.nan,
+                    efficiency=efficiency,
+                    capital_cost=capital_cost,
+                    marginal_cost=marginal_cost,
+                )
+
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
+                    if prev_cap > 0:
+                        n.links.loc[asset_id, "p_nom_max"] = max(installed_capacity_mw, prev_cap * 1.5)
+
+            elif asset_type == "uhs_withdrawal":
+                uhs_bus_id = f"uhs_{zone}"
+                if uhs_bus_id not in n.buses.index:
+                    n.add("Bus", uhs_bus_id, carrier="uhs_storage")
+
+                asset_id = f"uhs_withdrawal_{zone}"
+                installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
+                efficiency = _safe_float(row.get("efficiency", np.nan), default_costs["uhs_withdrawal_eff"])
+                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_withdrawal_capital"])
+                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_withdrawal_marginal"])
+
+                linked_min = installed_capacity_mw
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
+                    linked_min = max(installed_capacity_mw, prev_cap)
+
+                n.add(
+                    "Link",
+                    asset_id,
+                    bus0=uhs_bus_id,
+                    bus1=f"h2_{zone}",
+                    carrier="uhs_withdrawal",
+                    p_nom=installed_capacity_mw,
+                    p_nom_min=linked_min,
+                    p_nom_extendable=expansion_allowed,
+                    p_nom_max=installed_capacity_mw if not expansion_allowed else np.nan,
+                    efficiency=efficiency,
+                    capital_cost=capital_cost,
+                    marginal_cost=marginal_cost,
+                )
+
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
+                    if prev_cap > 0:
+                        n.links.loc[asset_id, "p_nom_max"] = max(installed_capacity_mw, prev_cap * 1.5)
+
+            elif asset_type == "uhs_store":
+                uhs_bus_id = f"uhs_{zone}"
+                if uhs_bus_id not in n.buses.index:
+                    n.add("Bus", uhs_bus_id, carrier="uhs_storage")
+
+                asset_id = f"uhs_store_{zone}"
+                installed_energy_mwh = _safe_float(row.get("installed_energy_mwh", 0.0), 0.0)
+                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_storage_capital"])
+                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_storage_marginal"])
+                standing_loss = _safe_float(row.get("standing_loss", np.nan), default_costs["uhs_storage_standing_loss"])
+
+                linked_min = installed_energy_mwh
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.stores.index:
+                    prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_mwh)
+                    linked_min = max(installed_energy_mwh, prev_energy)
+
+                n.add(
+                    "Store",
+                    asset_id,
+                    bus=uhs_bus_id,
+                    carrier="uhs_storage",
+                    e_nom=installed_energy_mwh,
+                    e_nom_min=linked_min,
+                    e_nom_extendable=expansion_allowed,
+                    e_nom_max=installed_energy_mwh if not expansion_allowed else np.nan,
+                    standing_loss=standing_loss,
+                    capital_cost=capital_cost,
+                    marginal_cost=marginal_cost,
+                )
+
+                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.stores.index:
+                    prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_mwh)
+                    if prev_energy > 0:
+                        n.stores.loc[asset_id, "e_nom_max"] = max(installed_energy_mwh, prev_energy * 1.5)
+
+            elif asset_type == "uhs":
+                uhs_bus_id = f"uhs_{zone}"
+                if uhs_bus_id not in n.buses.index:
+                    n.add("Bus", uhs_bus_id, carrier="uhs_storage")
+
+                installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
+                injection_capacity_mw = _safe_float(
+                    row.get("injection_capacity_mw", np.nan),
+                    installed_capacity_mw,
+                )
+                withdrawal_capacity_mw = _safe_float(
+                    row.get("withdrawal_capacity_mw", np.nan),
+                    installed_capacity_mw,
+                )
+                installed_energy_mwh = _safe_float(row.get("installed_energy_mwh", 0.0), 0.0)
+
+                injection_efficiency = _safe_float(
+                    row.get("injection_efficiency", np.nan),
+                    _safe_float(row.get("efficiency", np.nan), default_costs["uhs_injection_eff"]),
+                )
+                withdrawal_efficiency = _safe_float(
+                    row.get("withdrawal_efficiency", np.nan),
+                    _safe_float(row.get("efficiency", np.nan), default_costs["uhs_withdrawal_eff"]),
+                )
+
+                injection_capital_cost = _safe_float(
+                    row.get("injection_capital_cost", np.nan),
+                    _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_injection_capital"]),
+                )
+                withdrawal_capital_cost = _safe_float(
+                    row.get("withdrawal_capital_cost", np.nan),
+                    _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_withdrawal_capital"]),
+                )
+                storage_capital_cost = _safe_float(
+                    row.get("storage_capital_cost", np.nan),
+                    _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_storage_capital"]),
+                )
+
+                injection_marginal_cost = _safe_float(
+                    row.get("injection_marginal_cost", np.nan),
+                    _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_injection_marginal"]),
+                )
+                withdrawal_marginal_cost = _safe_float(
+                    row.get("withdrawal_marginal_cost", np.nan),
+                    _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_withdrawal_marginal"]),
+                )
+                storage_marginal_cost = _safe_float(
+                    row.get("storage_marginal_cost", np.nan),
+                    _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_storage_marginal"]),
+                )
+
+                standing_loss = _safe_float(
+                    row.get("standing_loss", np.nan),
+                    default_costs["uhs_storage_standing_loss"],
+                )
+
+                injection_available_from_year = int(
+                    _safe_float(
+                        row.get("injection_available_from_year", np.nan),
+                        _safe_float(row.get("available_from_year", model_year), model_year),
+                    )
+                )
+                withdrawal_available_from_year = int(
+                    _safe_float(
+                        row.get("withdrawal_available_from_year", np.nan),
+                        _safe_float(row.get("available_from_year", model_year), model_year),
+                    )
+                )
+                store_available_from_year = int(
+                    _safe_float(
+                        row.get("store_available_from_year", np.nan),
+                        _safe_float(row.get("available_from_year", model_year), model_year),
+                    )
+                )
+
+                inj_expansion_allowed = model_year >= injection_available_from_year
+                wdr_expansion_allowed = model_year >= withdrawal_available_from_year
+                store_expansion_allowed = model_year >= store_available_from_year
+
+                inj_id = f"uhs_injection_{zone}"
+                wdr_id = f"uhs_withdrawal_{zone}"
+                store_id = f"uhs_store_{zone}"
+
+                inj_linked_min = injection_capacity_mw
+                if inj_expansion_allowed and previous_year_network is not None and inj_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", inj_id, injection_capacity_mw)
+                    inj_linked_min = max(injection_capacity_mw, prev_cap)
+
+                n.add(
+                    "Link",
+                    inj_id,
+                    bus0=f"h2_{zone}",
+                    bus1=uhs_bus_id,
+                    carrier="uhs_injection",
+                    p_nom=injection_capacity_mw,
+                    p_nom_min=inj_linked_min,
+                    p_nom_extendable=inj_expansion_allowed,
+                    p_nom_max=injection_capacity_mw if not inj_expansion_allowed else np.nan,
+                    efficiency=injection_efficiency,
+                    capital_cost=injection_capital_cost,
+                    marginal_cost=injection_marginal_cost,
+                )
+
+                if inj_expansion_allowed and previous_year_network is not None and inj_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", inj_id, injection_capacity_mw)
+                    if prev_cap > 0:
+                        n.links.loc[inj_id, "p_nom_max"] = max(injection_capacity_mw, prev_cap * 1.5)
+
+                wdr_linked_min = withdrawal_capacity_mw
+                if wdr_expansion_allowed and previous_year_network is not None and wdr_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", wdr_id, withdrawal_capacity_mw)
+                    wdr_linked_min = max(withdrawal_capacity_mw, prev_cap)
+
+                n.add(
+                    "Link",
+                    wdr_id,
+                    bus0=uhs_bus_id,
+                    bus1=f"h2_{zone}",
+                    carrier="uhs_withdrawal",
+                    p_nom=withdrawal_capacity_mw,
+                    p_nom_min=wdr_linked_min,
+                    p_nom_extendable=wdr_expansion_allowed,
+                    p_nom_max=withdrawal_capacity_mw if not wdr_expansion_allowed else np.nan,
+                    efficiency=withdrawal_efficiency,
+                    capital_cost=withdrawal_capital_cost,
+                    marginal_cost=withdrawal_marginal_cost,
+                )
+
+                if wdr_expansion_allowed and previous_year_network is not None and wdr_id in previous_year_network.links.index:
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", wdr_id, withdrawal_capacity_mw)
+                    if prev_cap > 0:
+                        n.links.loc[wdr_id, "p_nom_max"] = max(withdrawal_capacity_mw, prev_cap * 1.5)
+
+                store_linked_min = installed_energy_mwh
+                if store_expansion_allowed and previous_year_network is not None and store_id in previous_year_network.stores.index:
+                    prev_energy = _previous_store_energy_capacity(previous_year_network, store_id, installed_energy_mwh)
+                    store_linked_min = max(installed_energy_mwh, prev_energy)
+
+                n.add(
+                    "Store",
+                    store_id,
+                    bus=uhs_bus_id,
+                    carrier="uhs_storage",
+                    e_nom=installed_energy_mwh,
+                    e_nom_min=store_linked_min,
+                    e_nom_extendable=store_expansion_allowed,
+                    e_nom_max=installed_energy_mwh if not store_expansion_allowed else np.nan,
+                    standing_loss=standing_loss,
+                    capital_cost=storage_capital_cost,
+                    marginal_cost=storage_marginal_cost,
+                )
+
+                if store_expansion_allowed and previous_year_network is not None and store_id in previous_year_network.stores.index:
+                    prev_energy = _previous_store_energy_capacity(previous_year_network, store_id, installed_energy_mwh)
+                    if prev_energy > 0:
+                        n.stores.loc[store_id, "e_nom_max"] = max(installed_energy_mwh, prev_energy * 1.5)
+
+    if co2_cap_tons is not None:
+        n.add(
+            "GlobalConstraint",
+            "co2_limit",
+            type="primary_energy",
+            carrier_attribute="co2_emissions",
+            sense="<=",
+            constant=float(co2_cap_tons),
+        )
+
+    return n
+
+
+def run_case(
+    year: int = 2030,
+    weather_year: int = 2019,
+    case_name: str = "case",
+    solver_name: str = "gurobi",
+    vre_profile_method: str = "simple",
+    wind_turbine: str = "Vestas_V112_3MW",
+    solar_panel: str = "CSi",
+    solar_orientation: str = "latitude_optimal",
+    solver_options: Optional[dict] = None,
+    time_limit: Optional[float] = None,
+    mip_gap: Optional[float] = None,
+    threads: Optional[int] = None,
+    prepare_cutout: bool = False,
+    fallback_to_highs: bool = True,
+    co2_cap_tons: Optional[float] = None,
+    enable_hydrogen: bool = True,
+    enable_heat: bool = True,
+    slack_cost_per_mwh: Optional[float] = None,
+    nodes_df: Optional[pd.DataFrame] = None,
+    capacity_df: Optional[pd.DataFrame] = None,
+    storage_df: Optional[pd.DataFrame] = None,
+    hydrogen_df: Optional[pd.DataFrame] = None,
+    hydrogen_demand: Optional[pd.DataFrame] = None,
+    previous_year_network=None,
+    csv_nodes: str = DEFAULT_PATHS["nodes_csv"],
+    csv_interlinks: str = DEFAULT_PATHS["interlinks_csv"],
+    csv_capacity: str = DEFAULT_PATHS["capacity_csv"],
+    csv_storage: str = DEFAULT_PATHS["storage_csv"],
+    csv_hydrogen: str = DEFAULT_PATHS["hydrogen_csv"],
+    csv_costs: str = DEFAULT_PATHS["costs_csv"],
+    csv_general: str = DEFAULT_PATHS["general_csv"],
+    csv_demand: str = DEFAULT_PATHS["demand_csv"],
+    csv_demand_summary: Optional[str] = DEFAULT_PATHS["demand_summary_csv"],
+    cutout_base_dir: str = "data",
+    cutout_file: Optional[str] = None,
+    cutout_bounds: Optional[Tuple[float, float, float, float]] = None,
+):
+    """Run PyPSA optimization for a generic case study and year."""
+    if nodes_df is None:
+        nodes_df = load_nodes_from_csv(csv_nodes)
+    if nodes_df is None:
+        raise FileNotFoundError(
+            f"Nodes CSV not found: {csv_nodes}. Define nodes in your case input folder."
+        )
+
+    if capacity_df is None:
+        capacity_df = load_generator_capacity_from_csv(csv_capacity)
+
+    if storage_df is None:
+        storage_df = load_storage_capacity_from_csv(csv_storage)
+    if hydrogen_df is None and enable_hydrogen:
+        hydrogen_df = load_hydrogen_assets_from_csv(csv_hydrogen)
+    if not enable_hydrogen:
+        hydrogen_df = None
+
+    general_settings = load_general_settings_from_csv(csv_general)
+    effective_slack_cost = _resolve_slack_cost(slack_cost_per_mwh, general_settings, default=500.0)
+
+    snapshots = build_snapshots(year=year)
+    demand_by_type, demand_summary = build_demands(
+        snapshots=snapshots,
+        nodes_df=nodes_df,
+        csv_nodes=csv_nodes,
+        demand_csv=csv_demand,
+        fallback_to_synthetic=True,
+        summary_output_csv=csv_demand_summary,
+    )
+    load = demand_by_type.get("electricity", pd.DataFrame(index=snapshots))
+    heat_load = demand_by_type.get("heat", pd.DataFrame(index=snapshots))
+    if not enable_heat:
+        heat_load = None
+
+    cutout = get_case_cutout(
+        year=weather_year,
+        force_prepare=prepare_cutout,
+        base_dir=cutout_base_dir,
+        case_name=case_name,
+        cutout_file=cutout_file,
+        bounds=cutout_bounds,
+        nodes_df=nodes_df,
+    )
+
+    wind_cf_hist, solar_cf_hist = get_vre_profiles_from_cutout(
+        cutout=cutout,
+        nodes_df=nodes_df,
+        method=vre_profile_method,
+        wind_turbine=wind_turbine,
+        solar_panel=solar_panel,
+        solar_orientation=solar_orientation,
+    )
+    wind_cf = map_weather_year(wind_cf_hist, target_year=year)
+    solar_cf = map_weather_year(solar_cf_hist, target_year=year)
+
+    network = build_case_network(
+        snapshots=snapshots,
+        nodes_df=nodes_df,
+        load=load,
+        heat_load=heat_load,
+        interlinks=None,
+        capacity_df=capacity_df,
+        storage_df=storage_df,
+        hydrogen_df=hydrogen_df,
+        hydrogen_demand=hydrogen_demand,
+        vre_profiles={"wind": wind_cf, "solar": solar_cf},
+        year=year,
+        previous_year_network=previous_year_network,
+        co2_cap_tons=co2_cap_tons,
+        general_settings=general_settings,
+        enable_hydrogen=enable_hydrogen,
+        slack_cost_per_mwh=effective_slack_cost,
+        csv_interlinks=csv_interlinks,
+        csv_capacity=csv_capacity,
+        csv_storage=csv_storage,
+        csv_hydrogen=csv_hydrogen,
+        csv_costs=csv_costs,
+    )
+
+    used_solver = solver_name
+
+    def _build_solver_options(target_solver: str, base_options: Optional[dict] = None) -> dict:
+        opts = dict(base_options or {})
+
+        if target_solver == "gurobi":
+            if time_limit is not None:
+                opts.setdefault("TimeLimit", float(time_limit))
+            if mip_gap is not None:
+                opts.setdefault("MIPGap", float(mip_gap))
+            if threads is not None:
+                opts.setdefault("Threads", int(threads))
+            opts.setdefault("OutputFlag", 0)
+            opts.setdefault("LogToConsole", 0)
+        elif target_solver == "highs":
+            if time_limit is not None:
+                opts.setdefault("time_limit", float(time_limit))
+            if mip_gap is not None:
+                opts.setdefault("mip_rel_gap", float(mip_gap))
+            if threads is not None:
+                opts.setdefault("threads", int(threads))
+
+        return opts
+
+    try:
+        primary_solver_options = _build_solver_options(solver_name, solver_options)
+        optimize_kwargs = {"solver_name": solver_name}
+        if primary_solver_options:
+            optimize_kwargs["solver_options"] = primary_solver_options
+        status, condition = network.optimize(**optimize_kwargs)
+    except Exception as exc:
+        if fallback_to_highs and solver_name == "gurobi":
+            print(f"Gurobi failed: {exc}. Using HiGHS.")
+            fallback_solver_options = _build_solver_options("highs")
+            fallback_kwargs = {"solver_name": "highs"}
+            if fallback_solver_options:
+                fallback_kwargs["solver_options"] = fallback_solver_options
+            status, condition = network.optimize(**fallback_kwargs)
+            used_solver = "highs"
+        else:
+            raise
+
+    objective_value = float(network.objective) if network.objective is not None else np.nan
+
+    return {
+        "year": year,
+        "weather_year": weather_year,
+        "case_name": case_name,
+        "network": network,
+        "snapshots": snapshots,
+        "nodes": nodes_df,
+        "load": load,
+        "heat_load": heat_load,
+        "wind_cf": wind_cf,
+        "solar_cf": solar_cf,
+        "cutout_path": str(cutout.path),
+        "status": status,
+        "condition": condition,
+        "objective": objective_value,
+        "solver": used_solver,
+        "co2_cap_tons": co2_cap_tons,
+        "enable_hydrogen": enable_hydrogen,
+        "slack_cost_per_mwh": effective_slack_cost,
+        "vre_profile_method": vre_profile_method,
+        "demand_summary": demand_summary,
+        "demand_by_type": demand_by_type,
+    }
+
+
+def run_case_multiple_years(
+    years: Optional[list] = None,
+    weather_year: int = 2019,
+    case_name: str = "case",
+    solver_name: str = "gurobi",
+    vre_profile_method: str = "simple",
+    wind_turbine: str = "Vestas_V112_3MW",
+    solar_panel: str = "CSi",
+    solar_orientation: str = "latitude_optimal",
+    solver_options: Optional[dict] = None,
+    time_limit: Optional[float] = None,
+    mip_gap: Optional[float] = None,
+    threads: Optional[int] = None,
+    prepare_cutout: bool = False,
+    fallback_to_highs: bool = True,
+    enable_year_linking: bool = True,
+    enable_hydrogen: bool = True,
+    enable_heat: bool = True,
+    slack_cost_per_mwh: Optional[float] = None,
+    hydrogen_demand: Optional[pd.DataFrame] = None,
+    co2_cap_tons=None,
+    csv_nodes: str = DEFAULT_PATHS["nodes_csv"],
+    csv_interlinks: str = DEFAULT_PATHS["interlinks_csv"],
+    csv_capacity: str = DEFAULT_PATHS["capacity_csv"],
+    csv_storage: str = DEFAULT_PATHS["storage_csv"],
+    csv_hydrogen: str = DEFAULT_PATHS["hydrogen_csv"],
+    csv_costs: str = DEFAULT_PATHS["costs_csv"],
+    csv_general: str = DEFAULT_PATHS["general_csv"],
+    csv_demand: str = DEFAULT_PATHS["demand_csv"],
+    csv_demand_summary: Optional[str] = DEFAULT_PATHS["demand_summary_csv"],
+    cutout_base_dir: str = "data",
+    cutout_file: Optional[str] = None,
+    cutout_bounds: Optional[Tuple[float, float, float, float]] = None,
+):
+    """Run optimization across multiple years with optional year-linking."""
+    if years is None:
+        years = [2030, 2040, 2050]
+
+    nodes_df = load_nodes_from_csv(csv_nodes)
+    if nodes_df is None:
+        raise FileNotFoundError(
+            f"Nodes CSV not found: {csv_nodes}. Define nodes in your case input folder."
+        )
+
+    capacity_df = load_generator_capacity_from_csv(csv_capacity)
+    storage_df = load_storage_capacity_from_csv(csv_storage)
+    hydrogen_df = load_hydrogen_assets_from_csv(csv_hydrogen) if enable_hydrogen else None
+    general_settings = load_general_settings_from_csv(csv_general)
+    effective_slack_cost = _resolve_slack_cost(slack_cost_per_mwh, general_settings, default=500.0)
+
+    results = {}
+    previous_network = None
+
+    for year in years:
+        print(f"\n{'=' * 60}")
+        print(f"Running optimization for {case_name} - {year}...")
+        if previous_network is not None and enable_year_linking:
+            prev_year = years[years.index(year) - 1]
+            print(f"  (with year-linking from {prev_year})")
+        print(f"{'=' * 60}")
+
+        result = run_case(
+            year=year,
+            weather_year=weather_year,
+            case_name=case_name,
+            solver_name=solver_name,
+            vre_profile_method=vre_profile_method,
+            wind_turbine=wind_turbine,
+            solar_panel=solar_panel,
+            solar_orientation=solar_orientation,
+            solver_options=solver_options,
+            time_limit=time_limit,
+            mip_gap=mip_gap,
+            threads=threads,
+            prepare_cutout=prepare_cutout,
+            fallback_to_highs=fallback_to_highs,
+            co2_cap_tons=_co2_cap_for_year(co2_cap_tons, year),
+            enable_hydrogen=enable_hydrogen,
+            enable_heat=enable_heat,
+            slack_cost_per_mwh=effective_slack_cost,
+            nodes_df=nodes_df,
+            capacity_df=capacity_df,
+            storage_df=storage_df,
+            hydrogen_df=hydrogen_df,
+            hydrogen_demand=hydrogen_demand,
+            previous_year_network=previous_network if enable_year_linking else None,
+            csv_nodes=csv_nodes,
+            csv_interlinks=csv_interlinks,
+            csv_capacity=csv_capacity,
+            csv_storage=csv_storage,
+            csv_hydrogen=csv_hydrogen,
+            csv_costs=csv_costs,
+            csv_general=csv_general,
+            csv_demand=csv_demand,
+            csv_demand_summary=csv_demand_summary,
+            cutout_base_dir=cutout_base_dir,
+            cutout_file=cutout_file,
+            cutout_bounds=cutout_bounds,
+        )
+
+        results[year] = result
+        print(f"Objective ({year}): {result['objective']:,.2f}")
+        print(f"Solver: {result['solver']}")
+
+        if enable_year_linking:
+            previous_network = result["network"]
+
+    return results
+
+
+def export_results_to_csv(
+    all_results: dict,
+    case_name: str = "case",
+    output_base_dir: str = ".",
+) -> str:
+    """Export multi-year optimization results to a dated output folder.
+
+    Creates a folder named ``output_<case_name>_YYYY_MM_DD`` under
+    *output_base_dir*. If *output_base_dir* points to an ``input_*`` folder,
+    output is written one level above it.
+    If the folder already exists a numeric suffix is appended
+    (``output_<case_name>_YYYY_MM_DD_2``, ``_3``, …).
+
+    Parameters
+    ----------
+    all_results : dict
+        Dictionary returned by :func:`run_case_multiple_years`.
+        Keys are years (int); values contain at minimum 'network',
+        'status', 'condition', 'objective', and 'solver'.
+    case_name : str
+        Used as prefix in output file names.
+    output_base_dir : str
+        Parent directory where the output folder is created.
+
+    Returns
+    -------
+    str
+        Absolute path of the created output folder.
+    """
+    from datetime import date
+
+    # ── resolve output folder ──────────────────────────────────────────────
+    output_root = Path(output_base_dir).resolve()
+    if output_root.name.lower().startswith("input_"):
+        output_root = output_root.parent
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    case_tag = str(case_name).strip()
+    case_tag = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in case_tag)
+    case_tag = case_tag.strip("_") or "case"
+
+    today = date.today().strftime("%Y_%m_%d")
+    base_name = f"output_{case_tag}_{today}"
+    folder = output_root / base_name
+    counter = 2
+    while folder.exists():
+        folder = output_root / f"{base_name}_{counter}"
+        counter += 1
+    folder.mkdir(parents=False, exist_ok=False)
+    print(f"Exporting results to: {folder}")
+
+    years = sorted(all_results.keys())
+
+    # ── 1. solver summary ─────────────────────────────────────────────────
+    rows = []
+    for year in years:
+        r = all_results[year]
+        rows.append({
+            "year": year,
+            "solver": r.get("solver", ""),
+            "status": r.get("status", ""),
+            "condition": r.get("condition", ""),
+            "objective": r.get("objective", float("nan")),
+        })
+    pd.DataFrame(rows).to_csv(
+        folder / f"{case_name}_solver_summary.csv", index=False
+    )
+
+    # ── 2. installed capacity by year, zone, technology ───────────────────
+    cap_rows = []
+    for year in years:
+        net = all_results[year]["network"]
+        for gen_id, row in net.generators.iterrows():
+            cap_rows.append({
+                "year": year,
+                "name": gen_id,
+                "bus": row["bus"],
+                "carrier": row["carrier"],
+                "p_nom_opt_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
+            })
+        for su_id, row in net.storage_units.iterrows():
+            cap_rows.append({
+                "year": year,
+                "name": su_id,
+                "bus": row["bus"],
+                "carrier": row.get("carrier", "bess"),
+                "p_nom_opt_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
+            })
+    pd.DataFrame(cap_rows).to_csv(
+        folder / f"{case_name}_capacity_by_year.csv", index=False
+    )
+
+    # ── 3. link capacities (interconnections + H2 links) by year ──────────
+    link_rows = []
+    for year in years:
+        net = all_results[year]["network"]
+        for lk_id, row in net.links.iterrows():
+            link_rows.append({
+                "year": year,
+                "name": lk_id,
+                "bus0": row["bus0"],
+                "bus1": row["bus1"],
+                "carrier": row.get("carrier", ""),
+                "p_nom_mw": row.get("p_nom", 0.0),
+                "p_nom_opt_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
+                "efficiency": row.get("efficiency", 1.0),
+            })
+    pd.DataFrame(link_rows).to_csv(
+        folder / f"{case_name}_links_by_year.csv", index=False
+    )
+
+    # ── 4. store capacities by year ────────────────────────────────────────
+    store_rows = []
+    for year in years:
+        net = all_results[year]["network"]
+        for st_id, row in net.stores.iterrows():
+            store_rows.append({
+                "year": year,
+                "name": st_id,
+                "bus": row["bus"],
+                "carrier": row.get("carrier", ""),
+                "e_nom_opt_mwh": row.get("e_nom_opt", row.get("e_nom", 0.0)),
+            })
+    pd.DataFrame(store_rows).to_csv(
+        folder / f"{case_name}_stores_by_year.csv", index=False
+    )
+
+    # ── 5. annual energy dispatch by year, technology ─────────────────────
+    dispatch_rows = []
+    for year in years:
+        net = all_results[year]["network"]
+        # generators
+        for gen_id in net.generators_t.p.columns:
+            total_mwh = float(net.generators_t.p[gen_id].sum())
+            carrier = net.generators.loc[gen_id, "carrier"] if gen_id in net.generators.index else ""
+            bus = net.generators.loc[gen_id, "bus"] if gen_id in net.generators.index else ""
+            dispatch_rows.append({
+                "year": year, "name": gen_id, "bus": bus,
+                "carrier": carrier, "energy_mwh": total_mwh,
+            })
+        # storage units (discharge positive, charge negative)
+        for su_id in net.storage_units_t.p.columns:
+            p = net.storage_units_t.p[su_id]
+            bus = net.storage_units.loc[su_id, "bus"] if su_id in net.storage_units.index else ""
+            carrier = net.storage_units.loc[su_id, "carrier"] if su_id in net.storage_units.index else "bess"
+            dispatch_rows.append({
+                "year": year, "name": su_id, "bus": bus,
+                "carrier": carrier, "energy_mwh": float(p.clip(lower=0).sum()),
+            })
+        # links (p0 = input to link)
+        for lk_id in net.links_t.p0.columns:
+            total_mwh = float(net.links_t.p0[lk_id].sum())
+            carrier = net.links.loc[lk_id, "carrier"] if lk_id in net.links.index else ""
+            bus0 = net.links.loc[lk_id, "bus0"] if lk_id in net.links.index else ""
+            dispatch_rows.append({
+                "year": year, "name": lk_id, "bus": bus0,
+                "carrier": carrier, "energy_mwh": total_mwh,
+            })
+    pd.DataFrame(dispatch_rows).to_csv(
+        folder / f"{case_name}_dispatch_by_year.csv", index=False
+    )
+
+    # ── 6. annual demand by year, zone ────────────────────────────────────
+    demand_rows = []
+    for year in years:
+        load_df = all_results[year].get("load")
+        if load_df is not None and not load_df.empty:
+            for zone in load_df.columns:
+                demand_rows.append({
+                    "year": year,
+                    "zone": zone,
+                    "demand_mwh": float(load_df[zone].sum()),
+                    "peak_mw": float(load_df[zone].max()),
+                })
+    pd.DataFrame(demand_rows).to_csv(
+        folder / f"{case_name}_demand_by_year.csv", index=False
+    )
+
+    # ── 7. link flows time series (one CSV per year) ───────────────────────
+    flows_dir = folder / "link_flows"
+    flows_dir.mkdir(parents=True, exist_ok=True)
+    for year in years:
+        net = all_results[year]["network"]
+        if not net.links_t.p0.empty:
+            net.links_t.p0.to_csv(
+                flows_dir / f"{case_name}_link_flows_{year}.csv"
+            )
+
+    # ── 8. CO2 emissions by year, carrier ─────────────────────────────────
+    co2_rows = []
+    for year in years:
+        net = all_results[year]["network"]
+        status = str(all_results[year].get("status", "")).lower()
+        carrier_factors = (
+            net.carriers["co2_emissions"]
+            if "co2_emissions" in net.carriers.columns
+            else pd.Series(dtype=float)
+        )
+        carrier_factors = carrier_factors.fillna(0.0)
+        dispatch_p = net.generators_t.p.reindex(columns=net.generators.index, fill_value=0.0)
+        gen_carrier = net.generators["carrier"].astype(str)
+        gen_eff = net.generators["efficiency"].replace(0, float("nan")).fillna(1.0)
+        ef = gen_carrier.map(carrier_factors).fillna(0.0) / gen_eff
+        emissions_ts = dispatch_p.multiply(ef, axis=1)
+        for carrier in gen_carrier.unique():
+            cols = gen_carrier.index[gen_carrier == carrier]
+            val = float(emissions_ts[cols].to_numpy().sum())
+            if val != 0.0:
+                co2_rows.append({"year": year, "carrier": carrier, "co2_tons": val})
+    pd.DataFrame(co2_rows).to_csv(
+        folder / f"{case_name}_co2_by_year.csv", index=False
+    )
+
+    print(f"  ✓ {case_name}_solver_summary.csv")
+    print(f"  ✓ {case_name}_capacity_by_year.csv")
+    print(f"  ✓ {case_name}_links_by_year.csv")
+    print(f"  ✓ {case_name}_stores_by_year.csv")
+    print(f"  ✓ {case_name}_dispatch_by_year.csv")
+    print(f"  ✓ {case_name}_demand_by_year.csv")
+    print(f"  ✓ link_flows/{case_name}_link_flows_<year>.csv  (per year)")
+    print(f"  ✓ {case_name}_co2_by_year.csv")
+    return str(folder)
+
+
+if __name__ == "__main__":
+    results = run_case_multiple_years(
+        years=[2030, 2040, 2050],
+        weather_year=2019,
+        case_name="example_case",
+        solver_name="gurobi",
+        prepare_cutout=False,
+        enable_year_linking=True,
+    )
+
+    print(f"\n{'=' * 60}")
+    print("SUMMARY")
+    print(f"{'=' * 60}")
+    for year, result in results.items():
+        print(f"Year {year}: {result['objective']:,.0f} ({result['solver']})")

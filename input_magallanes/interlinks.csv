@@ -1,0 +1,14 @@
+from_zone,to_zone,capacity_mw,loss_fraction,enabled
+# from_zone[name],to_zone[name],capacity_mw[MW],loss_fraction[fraction],enabled[bool]
+natales,puntaarenas,60,0.03,False
+natales,porvenir,40,0.03,False
+natales,puertowilliams,10,0.05,False
+puntaarenas,natales,60,0.03,False
+puntaarenas,porvenir,40,0.03,False
+puntaarenas,puertowilliams,10,0.05,False
+porvenir,natales,40,0.03,False
+porvenir,puntaarenas,40,0.03,False
+porvenir,puertowilliams,25,0.05,False
+puertowilliams,natales,10,0.05,False
+puertowilliams,puntaarenas,10,0.05,False
+puertowilliams,porvenir,25,0.05,False

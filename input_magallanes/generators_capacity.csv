@@ -1,0 +1,14 @@
+generator,zone,technology,capital_cost,marginal_cost,efficiency,installed_capacity,p_min_mw
+# generator[name],zone[name],technology[name],capital_cost[USD/MW/yr],marginal_cost[USD/MWh],efficiency[fraction],installed_capacity[MW],p_min_mw[MW]
+wind,natales,wind,110000,0,1,0,0
+wind,puntaarenas,wind,110000,0,1,0,0
+wind,porvenir,wind,110000,0,1,0,0
+wind,puertowilliams,wind,110000,0,1,0,0
+solar,natales,solar,60000,0,1,0,0
+solar,puntaarenas,solar,60000,0,1,0,0
+solar,porvenir,solar,60000,0,1,0,0
+solar,puertowilliams,solar,60000,0,1,0,0
+ocgt,natales,ocgt,45000,140,0.38,50,0
+ocgt,puntaarenas,ocgt,45000,140,0.38,80,25
+ocgt,porvenir,ocgt,45000,140,0.38,25,0
+ocgt,puertowilliams,ocgt,45000,140,0.38,15,0

@@ -1,0 +1,6 @@
+zone,installed_power_mw,max_hours,capital_cost,marginal_cost,efficiency_store,efficiency_dispatch,standing_loss
+# zone[name],installed_power_mw[MW],max_hours[hours],capital_cost[USD/MW/yr],marginal_cost[USD/MWh],efficiency_store[fraction],efficiency_dispatch[fraction],standing_loss[fraction/hour]
+natales,0,4,75000,0,0.95,0.95,0.001
+puntaarenas,0,4,75000,0,0.95,0.95,0.001
+porvenir,0,4,75000,0,0.95,0.95,0.001
+puertowilliams,0,4,75000,0,0.95,0.95,0.001

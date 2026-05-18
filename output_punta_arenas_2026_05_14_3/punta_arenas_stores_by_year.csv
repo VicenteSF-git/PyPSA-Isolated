@@ -1,9 +1,0 @@
-year,name,bus,carrier,e_nom_opt_mwh
-2025,h2_store_punta_arenas_2,h2_punta_arenas_2,hydrogen_storage,0.0
-2025,uhs_store_punta_arenas_2,uhs_punta_arenas_2,uhs_storage,0.0
-2030,h2_store_punta_arenas_2,h2_punta_arenas_2,hydrogen_storage,0.0
-2030,uhs_store_punta_arenas_2,uhs_punta_arenas_2,uhs_storage,0.0
-2040,h2_store_punta_arenas_2,h2_punta_arenas_2,hydrogen_storage,0.0
-2040,uhs_store_punta_arenas_2,uhs_punta_arenas_2,uhs_storage,0.0
-2050,h2_store_punta_arenas_2,h2_punta_arenas_2,hydrogen_storage,22.477209223443307
-2050,uhs_store_punta_arenas_2,uhs_punta_arenas_2,uhs_storage,1607.524133334022

@@ -1,4 +1,0 @@
-year,solver,status,condition,objective
-2030,gurobi,ok,optimal,19152568.201017205
-2040,gurobi,ok,optimal,19253938.26867739
-2050,gurobi,ok,optimal,30388599.878804404

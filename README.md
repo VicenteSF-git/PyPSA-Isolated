@@ -122,12 +122,143 @@ Open `case_analysis.ipynb` in Jupyter or VS Code. The notebook produces:
 
 ---
 
+## Demand scenarios
+
+`build_demand_scenarios.py` genera perfiles de demanda futuros a partir de un año base. Produce un archivo `demand_profiles_{scenario}.csv` por escenario (con todos los años juntos), que `run_case` carga automáticamente filtrando por rango de timestamps.
+
+### Flujo de trabajo
+
+**1. Configurar** `input_punta_arenas/config_demand_scenarios.csv`
+
+**2. Ejecutar:**
+```bash
+python build_demand_scenarios.py \
+  --input-case input_punta_arenas \
+  --base-demand-csv input_punta_arenas/demand_profiles.csv \
+  --config-csv input_punta_arenas/config_demand_scenarios.csv \
+  --base-year 2025 \
+  --years 2030 2040 2050
+```
+
+**3. Archivos generados en `input_punta_arenas/`:**
+
+| Archivo | Contenido |
+|---|---|
+| `demand_profiles_{scenario}.csv` | Perfil agregado (timestamp, zone, demand_type, demand_mw) |
+| `demand_components_{scenario}.csv` | Desglose por componente |
+| `demand_scenario_summary.csv` | Resumen anual por componente (energía, max, min, mean) |
+
+**4. Usar en el modelo:**
+```python
+paths = get_case_paths("input_punta_arenas")
+result = run_case(year=2030, case_name="punta_arenas",
+                  csv_demand="input_punta_arenas/demand_profiles_reference.csv",
+                  **paths)
+```
+
+---
+
+### `config_demand_scenarios.csv` — columnas
+
+| Columna | Descripción |
+|---|---|
+| `scenario` | Nombre del escenario (e.g. `reference`, `high_growth`) |
+| `year` | Año objetivo (e.g. 2030, 2040, 2050) |
+| `zone` | Zona del nodo (debe existir en `nodes.csv`) |
+| `component` | Ver componentes más abajo |
+| `enabled` | `True`/`False` — omite la fila si es False |
+| `growth_factor` | Factor multiplicador sobre el perfil base (solo `base_load`) |
+| `annual_energy_mwh` | Energía anual total a distribuir (MWh) |
+| `unit_count` | Cantidad de unidades (alternativa a `annual_energy_mwh`) |
+| `energy_per_unit_kwh_per_year` | Energía por unidad (kWh/año) |
+| `profile_type` | Forma horaria a usar (ver más abajo) |
+| `demand_type` | Tipo de demanda (`electricity`, `heat`, etc.) |
+
+La energía anual se puede definir de dos formas (se usa la primera disponible):
+- **Directa:** `annual_energy_mwh`
+- **Por actividad:** `unit_count × energy_per_unit_kwh_per_year / 1000`
+
+---
+
+### Componentes soportados
+
+| `component` | Descripción |
+|---|---|
+| `base_load` | Perfil histórico 2025 escalado por `growth_factor` |
+| `ev` | Carga de vehículos eléctricos |
+| `heating` | Calefacción eléctrica |
+| `cooking` | Cocina eléctrica |
+| `process_electrification` | Electrificación industrial |
+| `ptx_export` | Demanda de exportación (PtX) |
+
+---
+
+### Perfiles horarios por defecto
+
+Cuando `profile_type` coincide con el nombre del componente, se usa un perfil sintético definido en el código. Todos se normalizan para que su suma anual sea 1 antes de distribuir la energía.
+
+#### `base_load`
+Usa directamente la curva real del año base (`demand_profiles.csv`) mapeada al año objetivo. La transición entre año no-bisiesto y bisiesto replica las 24h del 28 de febrero en el 29 de febrero.
+
+#### `ev` — vehículos eléctricos
+- Pico nocturno centrado en **20:00** (σ = 2.5h), que simula recarga al llegar a casa
+- Base mínima del 25% del pico en el resto del día
+- **+10% los fines de semana** (mayor permanencia en el hogar)
+- Fórmula: `0.25 + 1.75 · exp(−0.5·((h−20)/2.5)²) × factor_fin_de_semana`
+
+#### `heating` — calefacción eléctrica
+- **Factor estacional** (hemisferio sur):
+  - Invierno (mayo–septiembre): ×1.8
+  - Verano (octubre–abril): ×0.6
+- Dos peaks diarios: **mañana ~7:00** (σ = 3.0h, amplitud 0.45) y **noche ~20:00** (σ = 3.5h, amplitud 0.35)
+- Base constante de 0.55
+- Fórmula: `factor_estacional × (0.55 + 0.45·exp(−((h−7)/3)²/2) + 0.35·exp(−((h−20)/3.5)²/2))`
+
+#### `cooking` — cocina eléctrica
+- Tres peaks diarios:
+  - **Desayuno ~8:00** (σ = 1.5h, amplitud 0.8)
+  - **Almuerzo ~13:00** (σ = 1.5h, amplitud 0.7)
+  - **Cena ~20:00** (σ = 1.8h, amplitud 1.2) — el más alto
+- Base mínima de 0.10
+- Sin variación estacional ni de día de semana
+
+#### `process_electrification` — industria
+- **Horario laboral (7:00–19:00):** factor 1.0 (`0.45 + 0.55 = 1.0`)
+- **Fuera de horario:** factor 0.45
+- **Fines de semana:** ×0.7 sobre todos los valores
+- Simula procesos industriales con operación reducida nocturna y en fines de semana
+
+#### `ptx_export` — exportación (PtX / H₂)
+- Perfil completamente plano (equivalente a `constant`)
+- Distribuye la energía anual uniformemente en todas las horas
+
+#### `constant`
+- Perfil plano. Útil para cargas que operan 24/7 sin variación (e.g. plantas de hidrógeno continuas).
+
+---
+
+### Perfiles personalizados (opcional)
+
+Para reemplazar cualquier perfil sintético con datos reales, crea un CSV con una columna por perfil y pásalo con `--profiles-csv`:
+
+```
+timestamp,ev,heating
+2025-01-01 00:00,0.12,0.30
+2025-01-01 01:00,0.09,0.28
+...
+```
+
+El nombre de la columna debe coincidir con el `profile_type` en el config. El script normaliza automáticamente cada perfil antes de usarlo.
+
+---
+
 ## Project structure
 
 ```
 PyPSA-Isolated/
 ├── config.py                      # Core API (run_case, run_case_multiple_years, etc.)
 ├── build_demand.py                # Demand profile construction
+├── build_demand_scenarios.py      # Demand scenario generator (future years)
 ├── case_analysis.ipynb            # Results visualization notebook
 │
 ├── input_punta_arenas/            # Example case: Punta Arenas

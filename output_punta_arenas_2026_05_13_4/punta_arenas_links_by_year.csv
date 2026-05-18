@@ -1,0 +1,7 @@
+year,name,bus0,bus1,carrier,p_nom_mw,p_nom_opt_mw,efficiency
+2030,link_punta_arenas_1_to_punta_arenas_2,elec_punta_arenas_1,elec_punta_arenas_2,electricity,1000.0,1000.0,1.0
+2030,link_punta_arenas_2_to_punta_arenas_1,elec_punta_arenas_2,elec_punta_arenas_1,electricity,1000.0,1000.0,1.0
+2040,link_punta_arenas_1_to_punta_arenas_2,elec_punta_arenas_1,elec_punta_arenas_2,electricity,1000.0,1000.0,1.0
+2040,link_punta_arenas_2_to_punta_arenas_1,elec_punta_arenas_2,elec_punta_arenas_1,electricity,1000.0,1000.0,1.0
+2050,link_punta_arenas_1_to_punta_arenas_2,elec_punta_arenas_1,elec_punta_arenas_2,electricity,1000.0,1000.0,1.0
+2050,link_punta_arenas_2_to_punta_arenas_1,elec_punta_arenas_2,elec_punta_arenas_1,electricity,1000.0,1000.0,1.0

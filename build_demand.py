@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -8,6 +9,7 @@ import pandas as pd
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 
 
 def make_load_profile_8760(
@@ -75,14 +77,53 @@ def _resolve_demand_csv(case_folder: Path, demand_csv: Optional[str]) -> Path:
 
 def _normalize_timestamps_to_snapshots(ts: pd.Series, snapshots: pd.DatetimeIndex) -> pd.DatetimeIndex:
     try:
-        idx = pd.to_datetime(ts, errors="raise")
+        idx = pd.DatetimeIndex(pd.to_datetime(ts, errors="raise"))
     except Exception as exc:
         raise ValueError(f"Invalid timestamp values in demand CSV: {exc}") from exc
 
     if idx.tz is not None:
         idx = idx.tz_convert(None)
 
-    return pd.DatetimeIndex(idx)
+    return idx
+
+
+def _expand_8760_profile_to_leap_year(
+    series: pd.Series,
+    snapshots: pd.DatetimeIndex,
+) -> pd.Series:
+    """Expand a non-leap annual profile to a leap-year snapshot index.
+
+    The 29 February hours are filled using the same hour from 28 February.
+    """
+    if len(snapshots) != 8784:
+        return series
+
+    leap_day_mask = (snapshots.month == 2) & (snapshots.day == 29)
+    if leap_day_mask.sum() != 24:
+        return series
+
+    base_index = snapshots[~leap_day_mask]
+    if len(series) != len(base_index):
+        return series
+
+    aligned = pd.Series(series.values, index=base_index, name=series.name)
+    leap_day = pd.date_range(
+        f"{snapshots[0].year}-02-29 00:00",
+        f"{snapshots[0].year}-02-29 23:00",
+        freq="h",
+    )
+    feb_28 = pd.date_range(
+        f"{snapshots[0].year}-02-28 00:00",
+        f"{snapshots[0].year}-02-28 23:00",
+        freq="h",
+    )
+    leap_values = aligned.reindex(feb_28).values
+    if len(leap_values) != 24 or pd.isna(leap_values).any():
+        return series
+
+    leap_series = pd.Series(leap_values, index=leap_day, name=series.name)
+    expanded = pd.concat([aligned, leap_series]).sort_index()
+    return expanded
 
 
 def _validate_series(
@@ -103,7 +144,7 @@ def _validate_series(
         )
 
     ts_index = _normalize_timestamps_to_snapshots(series_df["timestamp"], snapshots)
-    values = pd.to_numeric(series_df["demand_mw"], errors="coerce")
+    values = pd.to_numeric(series_df["demand_mw"], errors="coerce").astype(float)
 
     nan_count = int(values.isna().sum())
     if nan_count > 0:
@@ -117,16 +158,19 @@ def _validate_series(
             f"Negative demand_mw ({neg_count} rows) for demand_type='{demand_type}', zone='{zone}'"
         )
 
-    s = pd.Series(values.values, index=ts_index, name=zone).sort_index()
+    s = pd.Series(values.values.astype(float), index=ts_index, name=zone).sort_index()
 
     if not s.index.equals(snapshots):
-        missing = snapshots.difference(s.index)
-        extra = s.index.difference(snapshots)
-        raise ValueError(
-            "Demand timestamps must match snapshots exactly for "
-            f"demand_type='{demand_type}', zone='{zone}'. "
-            f"Missing={len(missing)}, Extra={len(extra)}"
-        )
+        expanded = _expand_8760_profile_to_leap_year(s, snapshots)
+        if not expanded.index.equals(snapshots):
+            missing = snapshots.difference(s.index)
+            extra = s.index.difference(snapshots)
+            raise ValueError(
+                "Demand timestamps must match snapshots exactly for "
+                f"demand_type='{demand_type}', zone='{zone}'. "
+                f"Missing={len(missing)}, Extra={len(extra)}"
+            )
+        s = expanded
 
     details["status"] = "ok"
     details["rows"] = str(len(s))
@@ -139,7 +183,7 @@ def _build_fallback_demand(
     demand_type: str,
     seed_start: int,
 ) -> pd.DataFrame:
-    out = pd.DataFrame(index=snapshots)
+    out = pd.DataFrame(index=snapshots, dtype=float)
 
     if demand_type == "electricity":
         if "annual_mean_mw" not in nodes_df.columns:
@@ -182,6 +226,7 @@ def build_demands(
     fallback_to_synthetic: bool = True,
     summary_output_csv: Optional[str] = None,
     seed_start_by_type: Optional[Dict[str, int]] = None,
+    demand_round_decimals: Optional[int] = None,
 ) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
     """
     Build demand profiles by type from CSV input with validation and synthetic fallback.
@@ -194,6 +239,14 @@ def build_demands(
     """
     if "zone" not in nodes_df.columns:
         raise ValueError("nodes_df must contain 'zone' column")
+
+    if demand_round_decimals is not None:
+        try:
+            demand_round_decimals = int(demand_round_decimals)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("demand_round_decimals must be an integer or None") from exc
+        if demand_round_decimals < 0:
+            raise ValueError("demand_round_decimals must be >= 0")
 
     case_folder = _infer_case_folder_from_nodes_csv(csv_nodes)
     demand_csv_path = _resolve_demand_csv(case_folder, demand_csv)
@@ -228,9 +281,24 @@ def build_demands(
             out = pd.DataFrame(index=snapshots)
 
             for zone in sorted(subset_type["zone"].unique()):
-                zone_df = subset_type[subset_type["zone"] == zone]
+                zone_df = subset_type[subset_type["zone"] == zone].copy()
+                # If the CSV contains multiple scenario years, keep only rows that fall
+                # within the current snapshot range, then drop any duplicate timestamps
+                # that may exist as block-separator artefacts.
+                try:
+                    ts_parsed = pd.to_datetime(zone_df["timestamp"], errors="coerce")
+                    mask = ts_parsed.between(snapshots.min(), snapshots.max())
+                    if mask.any():
+                        zone_df = zone_df[mask].copy()
+                    # Drop duplicate timestamps, keeping first occurrence
+                    zone_df = zone_df.drop_duplicates(subset=["timestamp"], keep="first")
+                except Exception:
+                    pass
                 series, _ = _validate_series(zone_df, demand_type, zone, snapshots)
                 out[zone] = series.values
+
+            if demand_round_decimals is not None:
+                out = out.round(demand_round_decimals)
 
             demand_by_type[demand_type] = out
 
@@ -250,6 +318,7 @@ def build_demands(
                         "max_mw": float(s.max()),
                     }
                 )
+
     elif not fallback_to_synthetic:
         raise FileNotFoundError(
             f"Demand CSV not found and fallback disabled: {demand_csv_path}"
@@ -258,6 +327,11 @@ def build_demands(
     # Only electricity gets a synthetic fallback; heat requires explicit CSV data
     if "electricity" not in demand_by_type:
         if fallback_to_synthetic:
+            logger.warning(
+                "Electricity demand CSV not found at %s; generating synthetic fallback demand for zones: %s",
+                demand_csv_path,
+                ", ".join(sorted(zones)),
+            )
             seed = int(seeds.get("electricity", 10))
             fallback_df = _build_fallback_demand(
                 snapshots=snapshots,

@@ -1,0 +1,13 @@
+year,name,bus,carrier,p_nom_opt_mw
+2040,slack_punta_arenas_1,elec_punta_arenas_1,slack,1000000.0
+2040,slack_punta_arenas_2,elec_punta_arenas_2,slack,1000000.0
+2040,wind_punta_arenas_2,elec_punta_arenas_2,wind,72.26849414456368
+2040,solar_punta_arenas_2,elec_punta_arenas_2,solar,0.0
+2040,ocgt_punta_arenas_2,elec_punta_arenas_2,ocgt,80.0
+2040,bess_punta_arenas_2,elec_punta_arenas_2,bess,19.58630580365036
+2050,slack_punta_arenas_1,elec_punta_arenas_1,slack,1000000.0
+2050,slack_punta_arenas_2,elec_punta_arenas_2,slack,1000000.0
+2050,wind_punta_arenas_2,elec_punta_arenas_2,wind,108.40274121684551
+2050,solar_punta_arenas_2,elec_punta_arenas_2,solar,104.51541143260582
+2050,ocgt_punta_arenas_2,elec_punta_arenas_2,ocgt,80.0
+2050,bess_punta_arenas_2,elec_punta_arenas_2,bess,29.379458705475543

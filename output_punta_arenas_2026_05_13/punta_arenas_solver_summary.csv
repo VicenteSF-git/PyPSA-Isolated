@@ -1,0 +1,3 @@
+year,solver,status,condition,objective
+2040,gurobi,ok,time_limit,20698818.63519783
+2050,gurobi,ok,optimal,45829124.18728956

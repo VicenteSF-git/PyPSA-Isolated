@@ -1,0 +1,3 @@
+year,solver,status,condition,objective
+2040,highs,ok,time_limit,30301756.177801974
+2050,highs,ok,optimal,77594157.64950101

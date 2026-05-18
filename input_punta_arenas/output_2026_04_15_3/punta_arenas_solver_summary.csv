@@ -1,0 +1,3 @@
+year,solver,status,condition,objective
+2040,gurobi,ok,optimal,22997860.571720406
+2050,gurobi,ok,optimal,50851219.295191295

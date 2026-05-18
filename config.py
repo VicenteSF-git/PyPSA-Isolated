@@ -20,6 +20,7 @@ from build_demand import build_demands
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_PATHS = {
@@ -33,6 +34,28 @@ DEFAULT_PATHS = {
     "demand_csv": "input_magallanes/demand_profiles.csv",
     "demand_summary_csv": "input_magallanes/demand_validation_summary.csv",
 }
+
+
+def _warn_if_synthetic_demand(
+    demand_summary: pd.DataFrame,
+    case_name: str,
+    csv_demand: Optional[str],
+) -> None:
+    if demand_summary is None or demand_summary.empty or "source" not in demand_summary.columns:
+        return
+
+    synthetic_rows = demand_summary[demand_summary["source"] == "synthetic_fallback"]
+    if synthetic_rows.empty:
+        return
+
+    demand_types = ", ".join(sorted(synthetic_rows["demand_type"].astype(str).unique()))
+    zones = ", ".join(sorted(synthetic_rows["zone"].astype(str).unique()))
+    message = (
+        f"Synthetic fallback demand used while running case '{case_name}' "
+        f"(CSV: {csv_demand}). Demand types: {demand_types}. Zones: {zones}"
+    )
+    print(message)
+    logger.warning(message)
 
 
 def configure_runtime_output() -> None:
@@ -407,6 +430,23 @@ def _project_costs_for_year(costs_df: Optional[pd.DataFrame], year: Optional[int
         return selected
 
     out = selected.copy()
+    numeric_cols = [
+        "capital_cost",
+        "marginal_cost",
+        "co2_emissions",
+        "annual_change",
+        "capital_cost_annual_change",
+        "marginal_cost_annual_change",
+        "co2_emissions_annual_change",
+    ]
+    for col in numeric_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype(float)
+
+    for col in ["capital_cost", "marginal_cost", "co2_emissions"]:
+        if col in out.columns:
+            out[col] = out[col].astype(float)
+
     for idx, row in out.iterrows():
         if "base_year" in out.columns and not pd.isna(row.get("base_year")):
             base_year = int(float(row.get("base_year")))
@@ -521,7 +561,8 @@ def _apply_cost_defaults(
                 if col in row.index:
                     if col not in capacity_output.columns:
                         capacity_output[col] = np.nan
-                    capacity_output.loc[mask & capacity_output[col].isna(), col] = row[col]
+                    capacity_output[col] = pd.to_numeric(capacity_output[col], errors="coerce").astype(float)
+                    capacity_output.loc[mask & capacity_output[col].isna(), col] = float(row[col])
 
     if storage_output is not None and not costs_df.empty:
         # Pick the first row matching a common storage technology label.
@@ -539,7 +580,8 @@ def _apply_cost_defaults(
                 if col in storage_cost_row.index:
                     if col not in storage_output.columns:
                         storage_output[col] = np.nan
-                    storage_output[col] = storage_output[col].fillna(storage_cost_row[col])
+                    storage_output[col] = pd.to_numeric(storage_output[col], errors="coerce").astype(float)
+                    storage_output[col] = storage_output[col].fillna(float(storage_cost_row[col]))
 
     return capacity_output, storage_output
 
@@ -824,15 +866,13 @@ def get_case_cutout(
 
     return cutout
 
-
 def _get_vre_profiles_simple(
     cutout,
     nodes_df: pd.DataFrame,
     default_wind_cf: float = 0.4,
     default_solar_cf: float = 0.15,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Build hourly wind and solar capacity factor profiles for each node.
+    """Build hourly wind and solar capacity factor profiles for each node.
 
     Nodes must include latitude/longitude coordinates (`lat`, `lon`).
     """
@@ -1009,7 +1049,6 @@ def map_weather_year(df_weather: pd.DataFrame, target_year: int = 2030) -> pd.Da
 
     new_index = pd.date_range(f"{target_year}-01-01 00:00", f"{target_year}-12-31 23:00", freq="h")
     is_target_leap = len(new_index) == 8784
-
     df_mapped = df_weather.copy().reset_index(drop=True)
 
     if len(df_mapped) == 8760 and is_target_leap:
@@ -1245,8 +1284,7 @@ def build_case_network(
                 bus0=f"gas_{z}",
                 bus1=f"heat_{z}",
                 carrier="gas_boiler",
-                p_nom=max(0.0, existing_gas_boiler_mw),
-                p_nom_extendable=False,
+                p_nom=float(max(0.0, existing_gas_boiler_mw)),
                 efficiency=gas_boiler_eff,
                 capital_cost=gas_boiler_capital,
                 marginal_cost=gas_boiler_marginal,
@@ -1283,10 +1321,10 @@ def build_case_network(
                 bus0=f"elec_{z}",
                 bus1=f"heat_{z}",
                 carrier="heat_pump",
-                p_nom=installed_hp_mw,
-                p_nom_min=hp_p_nom_min,
+                p_nom=float(installed_hp_mw),
+                p_nom_min=float(hp_p_nom_min),
                 p_nom_extendable=hp_expansion_allowed,
-                p_nom_max=installed_hp_mw if not hp_expansion_allowed else np.nan,
+                p_nom_max=float(installed_hp_mw) if not hp_expansion_allowed else np.nan,
                 efficiency=hp_cop,
                 capital_cost=hp_capital,
                 marginal_cost=hp_marginal,
@@ -1295,7 +1333,7 @@ def build_case_network(
             if hp_expansion_allowed and previous_year_network is not None and hp_id in previous_year_network.links.index:
                 prev_cap = _previous_nominal_capacity(previous_year_network, "links", hp_id, installed_hp_mw)
                 if prev_cap > 0:
-                    n.links.loc[hp_id, "p_nom_max"] = max(installed_hp_mw, prev_cap * 1.5)
+                    n.links.loc[hp_id, "p_nom_max"] = float(max(installed_hp_mw, prev_cap * 1.5))
 
         # Add slack generator for demand not supplied (penalty cost in USD/MWh)
         n.add(
@@ -1575,10 +1613,10 @@ def build_case_network(
                     bus0=f"elec_{zone}",
                     bus1=f"h2_{zone}",
                     carrier="electrolyzer",
-                    p_nom=installed_capacity_mw,
-                    p_nom_min=linked_min,
+                    p_nom=float(installed_capacity_mw),
+                    p_nom_min=float(linked_min),
                     p_nom_extendable=expansion_allowed,
-                    p_nom_max=installed_capacity_mw if not expansion_allowed else np.nan,
+                    p_nom_max=float(installed_capacity_mw) if not expansion_allowed else np.nan,
                     efficiency=efficiency,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
@@ -1587,7 +1625,7 @@ def build_case_network(
                 if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
                     if prev_cap > 0:
-                        n.links.loc[asset_id, "p_nom_max"] = max(installed_capacity_mw, prev_cap * 1.5)
+                        n.links.loc[asset_id, "p_nom_max"] = float(max(installed_capacity_mw, prev_cap * 1.5))
 
             elif asset_type in {"h2_fuel_cell", "h2_turbine"}:
                 asset_id = f"{asset_type}_{zone}"
@@ -1617,10 +1655,10 @@ def build_case_network(
                     bus0=f"h2_{zone}",
                     bus1=f"elec_{zone}",
                     carrier=asset_type,
-                    p_nom=installed_capacity_mw,
-                    p_nom_min=linked_min,
+                    p_nom=float(installed_capacity_mw),
+                    p_nom_min=float(linked_min),
                     p_nom_extendable=expansion_allowed,
-                    p_nom_max=installed_capacity_mw if not expansion_allowed else np.nan,
+                    p_nom_max=float(installed_capacity_mw) if not expansion_allowed else np.nan,
                     efficiency=efficiency,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
@@ -1629,7 +1667,7 @@ def build_case_network(
                 if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
                     if prev_cap > 0:
-                        n.links.loc[asset_id, "p_nom_max"] = max(installed_capacity_mw, prev_cap * 1.5)
+                        n.links.loc[asset_id, "p_nom_max"] = float(max(installed_capacity_mw, prev_cap * 1.5))
 
             elif asset_type == "h2_store_tank":
                 asset_id = f"h2_store_{zone}"
@@ -1648,10 +1686,10 @@ def build_case_network(
                     asset_id,
                     bus=f"h2_{zone}",
                     carrier="hydrogen_storage",
-                    e_nom=installed_energy_mwh,
-                    e_nom_min=linked_min,
+                    e_nom=float(installed_energy_mwh),
+                    e_nom_min=float(linked_min),
                     e_nom_extendable=expansion_allowed,
-                    e_nom_max=installed_energy_mwh if not expansion_allowed else np.nan,
+                    e_nom_max=float(installed_energy_mwh) if not expansion_allowed else np.nan,
                     standing_loss=standing_loss,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
@@ -1660,7 +1698,7 @@ def build_case_network(
                 if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.stores.index:
                     prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_mwh)
                     if prev_energy > 0:
-                        n.stores.loc[asset_id, "e_nom_max"] = max(installed_energy_mwh, prev_energy * 1.5)
+                        n.stores.loc[asset_id, "e_nom_max"] = float(max(installed_energy_mwh, prev_energy * 1.5))
 
             elif asset_type == "uhs_injection":
                 uhs_bus_id = f"uhs_{zone}"
@@ -1684,10 +1722,10 @@ def build_case_network(
                     bus0=f"h2_{zone}",
                     bus1=uhs_bus_id,
                     carrier="uhs_injection",
-                    p_nom=installed_capacity_mw,
-                    p_nom_min=linked_min,
+                    p_nom=float(installed_capacity_mw),
+                    p_nom_min=float(linked_min),
                     p_nom_extendable=expansion_allowed,
-                    p_nom_max=installed_capacity_mw if not expansion_allowed else np.nan,
+                    p_nom_max=float(installed_capacity_mw) if not expansion_allowed else np.nan,
                     efficiency=efficiency,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
@@ -1696,7 +1734,7 @@ def build_case_network(
                 if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
                     if prev_cap > 0:
-                        n.links.loc[asset_id, "p_nom_max"] = max(installed_capacity_mw, prev_cap * 1.5)
+                        n.links.loc[asset_id, "p_nom_max"] = float(max(installed_capacity_mw, prev_cap * 1.5))
 
             elif asset_type == "uhs_withdrawal":
                 uhs_bus_id = f"uhs_{zone}"
@@ -1720,10 +1758,10 @@ def build_case_network(
                     bus0=uhs_bus_id,
                     bus1=f"h2_{zone}",
                     carrier="uhs_withdrawal",
-                    p_nom=installed_capacity_mw,
-                    p_nom_min=linked_min,
+                    p_nom=float(installed_capacity_mw),
+                    p_nom_min=float(linked_min),
                     p_nom_extendable=expansion_allowed,
-                    p_nom_max=installed_capacity_mw if not expansion_allowed else np.nan,
+                    p_nom_max=float(installed_capacity_mw) if not expansion_allowed else np.nan,
                     efficiency=efficiency,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
@@ -1732,7 +1770,7 @@ def build_case_network(
                 if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
                     if prev_cap > 0:
-                        n.links.loc[asset_id, "p_nom_max"] = max(installed_capacity_mw, prev_cap * 1.5)
+                        n.links.loc[asset_id, "p_nom_max"] = float(max(installed_capacity_mw, prev_cap * 1.5))
 
             elif asset_type == "uhs_store":
                 uhs_bus_id = f"uhs_{zone}"
@@ -1755,10 +1793,10 @@ def build_case_network(
                     asset_id,
                     bus=uhs_bus_id,
                     carrier="uhs_storage",
-                    e_nom=installed_energy_mwh,
-                    e_nom_min=linked_min,
+                    e_nom=float(installed_energy_mwh),
+                    e_nom_min=float(linked_min),
                     e_nom_extendable=expansion_allowed,
-                    e_nom_max=installed_energy_mwh if not expansion_allowed else np.nan,
+                    e_nom_max=float(installed_energy_mwh) if not expansion_allowed else np.nan,
                     standing_loss=standing_loss,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
@@ -1888,10 +1926,10 @@ def build_case_network(
                     bus0=uhs_bus_id,
                     bus1=f"h2_{zone}",
                     carrier="uhs_withdrawal",
-                    p_nom=withdrawal_capacity_mw,
-                    p_nom_min=wdr_linked_min,
+                    p_nom=float(withdrawal_capacity_mw),
+                    p_nom_min=float(wdr_linked_min),
                     p_nom_extendable=wdr_expansion_allowed,
-                    p_nom_max=withdrawal_capacity_mw if not wdr_expansion_allowed else np.nan,
+                    p_nom_max=float(withdrawal_capacity_mw) if not wdr_expansion_allowed else np.nan,
                     efficiency=withdrawal_efficiency,
                     capital_cost=withdrawal_capital_cost,
                     marginal_cost=withdrawal_marginal_cost,
@@ -1900,7 +1938,7 @@ def build_case_network(
                 if wdr_expansion_allowed and previous_year_network is not None and wdr_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", wdr_id, withdrawal_capacity_mw)
                     if prev_cap > 0:
-                        n.links.loc[wdr_id, "p_nom_max"] = max(withdrawal_capacity_mw, prev_cap * 1.5)
+                        n.links.loc[wdr_id, "p_nom_max"] = float(max(withdrawal_capacity_mw, prev_cap * 1.5))
 
                 store_linked_min = installed_energy_mwh
                 if store_expansion_allowed and previous_year_network is not None and store_id in previous_year_network.stores.index:
@@ -1912,10 +1950,10 @@ def build_case_network(
                     store_id,
                     bus=uhs_bus_id,
                     carrier="uhs_storage",
-                    e_nom=installed_energy_mwh,
-                    e_nom_min=store_linked_min,
+                    e_nom=float(installed_energy_mwh),
+                    e_nom_min=float(store_linked_min),
                     e_nom_extendable=store_expansion_allowed,
-                    e_nom_max=installed_energy_mwh if not store_expansion_allowed else np.nan,
+                    e_nom_max=float(installed_energy_mwh) if not store_expansion_allowed else np.nan,
                     standing_loss=standing_loss,
                     capital_cost=storage_capital_cost,
                     marginal_cost=storage_marginal_cost,
@@ -1924,7 +1962,7 @@ def build_case_network(
                 if store_expansion_allowed and previous_year_network is not None and store_id in previous_year_network.stores.index:
                     prev_energy = _previous_store_energy_capacity(previous_year_network, store_id, installed_energy_mwh)
                     if prev_energy > 0:
-                        n.stores.loc[store_id, "e_nom_max"] = max(installed_energy_mwh, prev_energy * 1.5)
+                        n.stores.loc[store_id, "e_nom_max"] = float(max(installed_energy_mwh, prev_energy * 1.5))
 
     if co2_cap_tons is not None:
         n.add(
@@ -1958,6 +1996,7 @@ def run_case(
     enable_hydrogen: bool = True,
     enable_heat: bool = True,
     slack_cost_per_mwh: Optional[float] = None,
+    demand_round_decimals: Optional[int] = None,
     nodes_df: Optional[pd.DataFrame] = None,
     capacity_df: Optional[pd.DataFrame] = None,
     storage_df: Optional[pd.DataFrame] = None,
@@ -2006,9 +2045,30 @@ def run_case(
         demand_csv=csv_demand,
         fallback_to_synthetic=True,
         summary_output_csv=csv_demand_summary,
+        demand_round_decimals=demand_round_decimals,
     )
+    _warn_if_synthetic_demand(demand_summary, case_name=case_name, csv_demand=csv_demand)
     load = demand_by_type.get("electricity", pd.DataFrame(index=snapshots))
     heat_load = demand_by_type.get("heat", pd.DataFrame(index=snapshots))
+    zone_columns = nodes_df["zone"].astype(str).tolist()
+    missing_electricity_zones = [zone for zone in zone_columns if zone not in load.columns]
+    if missing_electricity_zones:
+        print(
+            "Warning: electricity demand is missing zones "
+            f"{missing_electricity_zones}; filling them with zero demand."
+        )
+        load = load.reindex(columns=zone_columns, fill_value=0.0)
+    else:
+        load = load.reindex(columns=zone_columns)
+
+    if heat_load is not None:
+        missing_heat_zones = [zone for zone in zone_columns if zone not in heat_load.columns]
+        if missing_heat_zones:
+            print(
+                "Warning: heat demand is missing zones "
+                f"{missing_heat_zones}; filling them with zero demand."
+            )
+        heat_load = heat_load.reindex(columns=zone_columns, fill_value=0.0)
     if not enable_heat:
         heat_load = None
 
@@ -2145,6 +2205,7 @@ def run_case_multiple_years(
     enable_hydrogen: bool = True,
     enable_heat: bool = True,
     slack_cost_per_mwh: Optional[float] = None,
+    demand_round_decimals: Optional[int] = None,
     hydrogen_demand: Optional[pd.DataFrame] = None,
     co2_cap_tons=None,
     csv_nodes: str = DEFAULT_PATHS["nodes_csv"],
@@ -2206,6 +2267,7 @@ def run_case_multiple_years(
             enable_hydrogen=enable_hydrogen,
             enable_heat=enable_heat,
             slack_cost_per_mwh=effective_slack_cost,
+            demand_round_decimals=demand_round_decimals,
             nodes_df=nodes_df,
             capacity_df=capacity_df,
             storage_df=storage_df,

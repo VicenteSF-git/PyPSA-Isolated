@@ -1,8 +1,0 @@
-year,name,bus0,bus1,carrier,p_nom_mw,p_nom_opt_mw,efficiency
-2050,link_punta_arenas_1_to_punta_arenas_2,elec_punta_arenas_1,elec_punta_arenas_2,electricity,1000.0,1000.0,1.0
-2050,link_punta_arenas_2_to_punta_arenas_1,elec_punta_arenas_2,elec_punta_arenas_1,electricity,1000.0,1000.0,1.0
-2050,h2_electrolyzer_punta_arenas_2,elec_punta_arenas_2,h2_punta_arenas_2,electrolyzer,0.0,7.668138579015687,0.7
-2050,h2_fuel_cell_punta_arenas_2,h2_punta_arenas_2,elec_punta_arenas_2,h2_fuel_cell,0.0,10.47427542032226,0.55
-2050,h2_turbine_punta_arenas_2,h2_punta_arenas_2,elec_punta_arenas_2,h2_turbine,0.0,-0.0,0.45
-2050,uhs_injection_punta_arenas_2,h2_punta_arenas_2,uhs_punta_arenas_2,uhs_injection,0.0,5.367697005310981,0.98
-2050,uhs_withdrawal_punta_arenas_2,uhs_punta_arenas_2,h2_punta_arenas_2,uhs_withdrawal,0.0,10.688036143185977,0.98

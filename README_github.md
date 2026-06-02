@@ -14,15 +14,14 @@ cd PyPSA-Isolated
 Recommended (Conda):
 
 ```bash
-conda create -n pypsa-isolated python=3.11 -y
+conda env create -f environment.yml
 conda activate pypsa-isolated
 ```
 
-Install dependencies:
+If you later change the dependency file, refresh the environment with:
 
 ```bash
-conda install -c conda-forge pypsa atlite numpy pandas xarray matplotlib folium jupyter -y
-pip install highspy
+conda env update -f environment.yml --prune
 ```
 
 Optional (if you have a Gurobi license):
@@ -30,6 +29,8 @@ Optional (if you have a Gurobi license):
 ```bash
 conda install -c gurobi gurobi -y
 ```
+
+The repository now includes `environment.yml`, so cloning from GitHub and running the commands above is enough to recreate the environment on another machine.
 
 ## 3. Run the model from the model/ folder
 

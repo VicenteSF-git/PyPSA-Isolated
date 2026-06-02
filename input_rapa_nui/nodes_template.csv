@@ -1,0 +1,16 @@
+# Template for nodes.csv
+# Copy this file and fill it with your case study data.
+# 
+# Required columns:
+#   zone            - Unique identifier for each node/zone
+#   annual_mean_mw  - Average annual load in MW
+#
+# Recommended columns:
+#   lat             - Latitude (decimal degrees, for VRE profiles)
+#   lon             - Longitude (decimal degrees, for VRE profiles)
+#   enabled         - True to include this node, False to skip it
+#
+# Example for a two-node split system:
+zone,annual_mean_mw,lat,lon,enabled
+punta_arenas_1,38.0,-53.16,-70.93,True
+punta_arenas_2,0.0,-53.16,-70.89,True

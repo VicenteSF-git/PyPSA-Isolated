@@ -306,6 +306,17 @@ def load_hydrogen_assets_from_csv(
     - withdrawal_available_from_year
     - store_available_from_year
 
+    Seasonal operation columns (optional, for continuous-window reservoirs):
+    - continuous_operation: 1 = enforce seasonal windows as hard 0/1 p_max_pu masks,
+        0 = no restriction (default; optimizer decides freely when to inject/withdraw).
+    - injection_season_start: day of year (1–365) when the injection window opens.
+    - injection_season_days: number of consecutive days for injection.
+    - withdrawal_season_start: day of year (1–365) when the withdrawal window opens.
+    - withdrawal_season_days: number of consecutive days for withdrawal.
+    Windows may wrap across the year boundary (e.g., start=300, days=150 wraps into January).
+    Useful for depleted-gas-reservoir UHS where continuous seasonal blocks are required
+    to avoid mixing and pressure transients (e.g., ~200 days injection, ~100 days winter withdrawal).
+
         For explicit UHS asset rows:
         - uhs_injection: uses installed_capacity_mw, efficiency, capital_cost,
             marginal_cost, available_from_year.
@@ -804,6 +815,23 @@ def build_snapshots(year: int = 2030) -> pd.DatetimeIndex:
     expected_hours = 8784 if is_leap else 8760
     assert len(snapshots) == expected_hours, f"Expected {expected_hours} hours, got {len(snapshots)}"
     return snapshots
+
+
+def _build_seasonal_mask(snapshots: pd.DatetimeIndex, start_day: int, duration_days: int) -> pd.Series:
+    """Return a 0/1 hourly Series covering a continuous seasonal window.
+
+    start_day: day-of-year (1–365) when the window opens.
+    duration_days: length of the window in days.
+    The window wraps across the year boundary if start_day + duration_days > 365.
+    """
+    doy = snapshots.day_of_year
+    end_day = start_day + duration_days - 1
+    if end_day <= 365:
+        mask = (doy >= start_day) & (doy <= end_day)
+    else:
+        wrap_end = end_day - 365
+        mask = (doy >= start_day) | (doy <= wrap_end)
+    return pd.Series(mask.astype(float), index=snapshots, dtype=float)
 
 
 def _derive_cutout_bounds(
@@ -1590,6 +1618,11 @@ def build_case_network(
             "h2_tank": "h2_store_tank",
             "h2_uhs": "uhs",
             "h2_store_uhs": "uhs",
+            # Depleted-gas-reservoir aliases → UHS implementation
+            "dgr_injection": "uhs_injection",
+            "dgr_withdrawal": "uhs_withdrawal",
+            "dgr_store": "uhs_store",
+            "dgr": "uhs",
         }
 
         for _, row in hydrogen_df.iterrows():
@@ -1718,14 +1751,19 @@ def build_case_network(
                 capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_injection_capital"])
                 marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_injection_marginal"])
 
+                continuous_op = int(_safe_float(row.get("continuous_operation", 0), 0))
+                inj_season_start = _safe_float(row.get("injection_season_start", np.nan), np.nan)
+                inj_season_days = _safe_float(row.get("injection_season_days", np.nan), np.nan)
+                inj_p_max_pu = None
+                if continuous_op == 1 and not pd.isna(inj_season_start) and not pd.isna(inj_season_days):
+                    inj_p_max_pu = _build_seasonal_mask(snapshots, int(inj_season_start), int(inj_season_days))
+
                 linked_min = installed_capacity_mw
                 if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
                     linked_min = max(installed_capacity_mw, prev_cap)
 
-                n.add(
-                    "Link",
-                    asset_id,
+                inj_link_attrs = dict(
                     bus0=f"h2_{zone}",
                     bus1=uhs_bus_id,
                     carrier="uhs_injection",
@@ -1737,6 +1775,9 @@ def build_case_network(
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
                 )
+                if inj_p_max_pu is not None:
+                    inj_link_attrs["p_max_pu"] = inj_p_max_pu.values
+                n.add("Link", asset_id, **inj_link_attrs)
 
                 if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
@@ -1754,14 +1795,19 @@ def build_case_network(
                 capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_withdrawal_capital"])
                 marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_withdrawal_marginal"])
 
+                continuous_op = int(_safe_float(row.get("continuous_operation", 0), 0))
+                wdr_season_start = _safe_float(row.get("withdrawal_season_start", np.nan), np.nan)
+                wdr_season_days = _safe_float(row.get("withdrawal_season_days", np.nan), np.nan)
+                wdr_p_max_pu = None
+                if continuous_op == 1 and not pd.isna(wdr_season_start) and not pd.isna(wdr_season_days):
+                    wdr_p_max_pu = _build_seasonal_mask(snapshots, int(wdr_season_start), int(wdr_season_days))
+
                 linked_min = installed_capacity_mw
                 if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
                     linked_min = max(installed_capacity_mw, prev_cap)
 
-                n.add(
-                    "Link",
-                    asset_id,
+                wdr_link_attrs = dict(
                     bus0=uhs_bus_id,
                     bus1=f"h2_{zone}",
                     carrier="uhs_withdrawal",
@@ -1773,6 +1819,9 @@ def build_case_network(
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
                 )
+                if wdr_p_max_pu is not None:
+                    wdr_link_attrs["p_max_pu"] = wdr_p_max_pu.values
+                n.add("Link", asset_id, **wdr_link_attrs)
 
                 if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
@@ -1893,6 +1942,19 @@ def build_case_network(
                 wdr_expansion_allowed = model_year >= withdrawal_available_from_year
                 store_expansion_allowed = model_year >= store_available_from_year
 
+                continuous_op = int(_safe_float(row.get("continuous_operation", 0), 0))
+                inj_season_start = _safe_float(row.get("injection_season_start", np.nan), np.nan)
+                inj_season_days = _safe_float(row.get("injection_season_days", np.nan), np.nan)
+                wdr_season_start = _safe_float(row.get("withdrawal_season_start", np.nan), np.nan)
+                wdr_season_days = _safe_float(row.get("withdrawal_season_days", np.nan), np.nan)
+                inj_p_max_pu = None
+                wdr_p_max_pu = None
+                if continuous_op == 1:
+                    if not pd.isna(inj_season_start) and not pd.isna(inj_season_days):
+                        inj_p_max_pu = _build_seasonal_mask(snapshots, int(inj_season_start), int(inj_season_days))
+                    if not pd.isna(wdr_season_start) and not pd.isna(wdr_season_days):
+                        wdr_p_max_pu = _build_seasonal_mask(snapshots, int(wdr_season_start), int(wdr_season_days))
+
                 inj_id = f"uhs_injection_{zone}"
                 wdr_id = f"uhs_withdrawal_{zone}"
                 store_id = f"uhs_store_{zone}"
@@ -1902,9 +1964,7 @@ def build_case_network(
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", inj_id, injection_capacity_mw)
                     inj_linked_min = max(injection_capacity_mw, prev_cap)
 
-                n.add(
-                    "Link",
-                    inj_id,
+                inj_link_attrs = dict(
                     bus0=f"h2_{zone}",
                     bus1=uhs_bus_id,
                     carrier="uhs_injection",
@@ -1916,6 +1976,9 @@ def build_case_network(
                     capital_cost=injection_capital_cost,
                     marginal_cost=injection_marginal_cost,
                 )
+                if inj_p_max_pu is not None:
+                    inj_link_attrs["p_max_pu"] = inj_p_max_pu.values
+                n.add("Link", inj_id, **inj_link_attrs)
 
                 if inj_expansion_allowed and previous_year_network is not None and inj_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", inj_id, injection_capacity_mw)
@@ -1927,9 +1990,7 @@ def build_case_network(
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", wdr_id, withdrawal_capacity_mw)
                     wdr_linked_min = max(withdrawal_capacity_mw, prev_cap)
 
-                n.add(
-                    "Link",
-                    wdr_id,
+                wdr_link_attrs = dict(
                     bus0=uhs_bus_id,
                     bus1=f"h2_{zone}",
                     carrier="uhs_withdrawal",
@@ -1941,6 +2002,9 @@ def build_case_network(
                     capital_cost=withdrawal_capital_cost,
                     marginal_cost=withdrawal_marginal_cost,
                 )
+                if wdr_p_max_pu is not None:
+                    wdr_link_attrs["p_max_pu"] = wdr_p_max_pu.values
+                n.add("Link", wdr_id, **wdr_link_attrs)
 
                 if wdr_expansion_allowed and previous_year_network is not None and wdr_id in previous_year_network.links.index:
                     prev_cap = _previous_nominal_capacity(previous_year_network, "links", wdr_id, withdrawal_capacity_mw)
@@ -2147,6 +2211,16 @@ def run_case(
                 opts.setdefault("threads", int(threads))
 
         return opts
+
+    # pandas 3.0+ uses ArrowStringArray for string columns by default,
+    # which xarray cannot index. Convert all string columns to object dtype.
+    for comp_df in [
+        network.buses, network.generators, network.loads, network.lines,
+        network.links, network.storage_units, network.stores,
+    ]:
+        for col in comp_df.columns:
+            if pd.api.types.is_string_dtype(comp_df[col]) and not comp_df[col].dtype == object:
+                comp_df[col] = comp_df[col].astype(object)
 
     try:
         primary_solver_options = _build_solver_options(solver_name, solver_options)

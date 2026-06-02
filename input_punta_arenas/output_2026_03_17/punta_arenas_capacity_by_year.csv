@@ -1,7 +1,0 @@
-year,name,bus,carrier,p_nom_opt_mw
-2050,slack_punta_arenas_1,elec_punta_arenas_1,slack,1000000.0
-2050,slack_punta_arenas_2,elec_punta_arenas_2,slack,1000000.0
-2050,wind_punta_arenas_2,elec_punta_arenas_2,wind,104.08397513029867
-2050,solar_punta_arenas_2,elec_punta_arenas_2,solar,101.43411821116707
-2050,ocgt_punta_arenas_2,elec_punta_arenas_2,ocgt,80.0
-2050,bess_punta_arenas_2,elec_punta_arenas_2,bess,91.51989293864787

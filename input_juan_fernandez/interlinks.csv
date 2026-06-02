@@ -1,0 +1,4 @@
+from_zone,to_zone,capacity_mw,loss_fraction,enabled
+# from_zone[name],to_zone[name],capacity_mw[MW],loss_fraction[fraction],enabled[bool]
+punta_arenas_1,punta_arenas_2,1000,0.0,True
+punta_arenas_2,punta_arenas_1,1000,0.0,True

@@ -1,0 +1,5 @@
+zone,annual_mean_mw,annual_heat_mean_mw,existing_gas_boiler_mw,installed_heat_pump_mw,allow_heat_pump,heat_pump_cop,gas_boiler_efficiency,lat,lon,enabled
+# zone[name],annual_mean_mw[MW],annual_heat_mean_mw[MW],existing_gas_boiler_mw[MW],installed_heat_pump_mw[MW],allow_heat_pump[bool],heat_pump_cop[MWth/MWel],gas_boiler_efficiency[fraction],lat[degrees],lon[degrees],enabled[bool]
+hanga_roa,6.0,2.5,2.0,0.0,True,3.2,0.90,-27.1460,-109.4320,True
+anakena,2.0,0.8,0.6,0.0,True,3.2,0.90,-27.0700,-109.2750,True
+orongo,1.5,0.5,0.4,0.0,True,3.2,0.90,-27.1700,-109.4300,True

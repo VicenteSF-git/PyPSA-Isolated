@@ -1,0 +1,10 @@
+from_zone,to_zone,capacity_mw,loss_fraction,enabled
+# from_zone[name],to_zone[name],capacity_mw[MW],loss_fraction[fraction],enabled[bool]
+auckland,hamilton,2000,0.02,True
+hamilton,auckland,2000,0.02,True
+hamilton,wellington,1500,0.03,True
+wellington,hamilton,1500,0.03,True
+wellington,christchurch,1200,0.04,True
+christchurch,wellington,1200,0.04,True
+christchurch,dunedin,1000,0.03,True
+dunedin,christchurch,1000,0.03,True

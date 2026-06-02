@@ -1,0 +1,17 @@
+generator,zone,technology,capital_cost,marginal_cost,efficiency,installed_capacity,p_min_mw,available_from_year
+# generator[name],zone[name],technology[name],capital_cost[USD/MW/yr],marginal_cost[USD/MWh],efficiency[fraction],installed_capacity[MW],p_min_mw[MW],available_from_year[year]
+wind,auckland,wind,110000,0,1,0,0,2025
+solar,auckland,solar,60000,0,1,0,0,2025
+ocgt,auckland,ocgt,45000,140,0.38,0,0,2025
+wind,hamilton,wind,110000,0,1,0,0,2025
+solar,hamilton,solar,60000,0,1,0,0,2025
+ocgt,hamilton,ocgt,45000,140,0.38,0,0,2025
+wind,wellington,wind,110000,0,1,0,0,2025
+solar,wellington,solar,60000,0,1,0,0,2025
+ocgt,wellington,ocgt,45000,140,0.38,0,0,2025
+wind,christchurch,wind,110000,0,1,0,0,2025
+solar,christchurch,solar,60000,0,1,0,0,2025
+ocgt,christchurch,ocgt,45000,140,0.38,0,0,2025
+wind,dunedin,wind,110000,0,1,0,0,2025
+solar,dunedin,solar,60000,0,1,0,0,2025
+ocgt,dunedin,ocgt,45000,140,0.38,0,0,2025

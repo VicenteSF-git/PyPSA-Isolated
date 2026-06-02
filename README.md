@@ -28,22 +28,27 @@ cd PyPSA-Isolated
 ### 2. Create the conda environment
 
 ```bash
-conda create -n pypsa-isolated python=3.11 -y
+conda env create -f environment.yml
 conda activate pypsa-isolated
+```
+
+If you already created the environment and only want to refresh it after changes, use:
+
+```bash
+conda env update -f environment.yml --prune
 ```
 
 ### 3. Install dependencies
 
-```bash
-conda install -c conda-forge pypsa atlite numpy pandas xarray matplotlib folium jupyter -y
-pip install highspy
-```
+The environment file already includes the core Python packages used by the project, including `pypsa`, `atlite`, `numpy`, `pandas`, `xarray`, `matplotlib`, `folium`, `jupyter`, `openpyxl`, and `highspy`.
 
 If you have a Gurobi license, also install:
 
 ```bash
 conda install -c gurobi gurobi -y
 ```
+
+If you prefer manual installation instead of `environment.yml`, you can still install the packages with `conda install` and `pip install` as before.
 
 ### 4. Configure CDS API (for ERA5 cutouts)
 

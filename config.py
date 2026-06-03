@@ -1477,13 +1477,29 @@ def build_case_network(
                     continue
                 expansion_allowed = False
             else:
+                # Skip flexible generators that haven't reached their commissioning year yet.
+                # Without this, they are added as fixed capacity (p_nom = installed_cap)
+                # even though they're not built yet.
+                if earliest_commissioning_year is not None and model_year < earliest_commissioning_year:
+                    continue
                 expansion_allowed = earliest_commissioning_year is not None and model_year >= earliest_commissioning_year
 
             gen_id = f"{gen_name}_{zone}"
             use_unit_commitment = p_min_mw > 0 and installed_cap > 0
 
-            linked_p_nom_min = installed_cap
-            if (
+            # Expandable generators: optimizer decides build amount from 0 to installed_cap.
+            # Existing/fixed generators: always hold their full installed_cap.
+            effectively_expandable = expansion_allowed and not use_unit_commitment
+            linked_p_nom_min = 0.0 if effectively_expandable else installed_cap
+            if effectively_expandable:
+                if (
+                    previous_year_network is not None
+                    and gen_id in previous_year_network.generators.index
+                ):
+                    # Year-linked: don't allow built capacity to decrease.
+                    prev_cap = _previous_nominal_capacity(previous_year_network, "generators", gen_id, installed_cap)
+                    linked_p_nom_min = prev_cap
+            elif (
                 expansion_allowed
                 and previous_year_network is not None
                 and gen_id in previous_year_network.generators.index
@@ -1502,6 +1518,10 @@ def build_case_network(
             }
 
             if not expansion_allowed:
+                attrs["p_nom_max"] = installed_cap
+            elif not use_unit_commitment:
+                # Cap the optimizer at the scenario's planned capacity.
+                # (For year-linked runs the post-add block may raise this to prev_cap * 1.5.)
                 attrs["p_nom_max"] = installed_cap
 
             if efficiency != 1.0:
@@ -2471,6 +2491,10 @@ def export_results_to_csv(
 
     years = sorted(all_results.keys())
 
+    # Limit float precision so Excel does not interpret long binary-tail decimals
+    # as oversized numbers and convert them unexpectedly.
+    csv_float_format = "%.6f"
+
     # ── 1. solver summary ─────────────────────────────────────────────────
     rows = []
     for year in years:
@@ -2483,7 +2507,7 @@ def export_results_to_csv(
             "objective": r.get("objective", float("nan")),
         })
     pd.DataFrame(rows).to_csv(
-        folder / f"{case_name}_solver_summary.csv", index=False
+        folder / f"{case_name}_solver_summary.csv", index=False, float_format=csv_float_format
     )
 
     # ── 2. installed capacity by year, zone, technology ───────────────────
@@ -2507,7 +2531,7 @@ def export_results_to_csv(
                 "p_nom_opt_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
             })
     pd.DataFrame(cap_rows).to_csv(
-        folder / f"{case_name}_capacity_by_year.csv", index=False
+        folder / f"{case_name}_capacity_by_year.csv", index=False, float_format=csv_float_format
     )
 
     # ── 3. link capacities (interconnections + H2 links) by year ──────────
@@ -2526,7 +2550,7 @@ def export_results_to_csv(
                 "efficiency": row.get("efficiency", 1.0),
             })
     pd.DataFrame(link_rows).to_csv(
-        folder / f"{case_name}_links_by_year.csv", index=False
+        folder / f"{case_name}_links_by_year.csv", index=False, float_format=csv_float_format
     )
 
     # ── 4. store capacities by year ────────────────────────────────────────
@@ -2542,7 +2566,7 @@ def export_results_to_csv(
                 "e_nom_opt_mwh": row.get("e_nom_opt", row.get("e_nom", 0.0)),
             })
     pd.DataFrame(store_rows).to_csv(
-        folder / f"{case_name}_stores_by_year.csv", index=False
+        folder / f"{case_name}_stores_by_year.csv", index=False, float_format=csv_float_format
     )
 
     # ── 5. annual energy dispatch by year, technology ─────────────────────
@@ -2577,7 +2601,7 @@ def export_results_to_csv(
                 "carrier": carrier, "energy_mwh": total_mwh,
             })
     pd.DataFrame(dispatch_rows).to_csv(
-        folder / f"{case_name}_dispatch_by_year.csv", index=False
+        folder / f"{case_name}_dispatch_by_year.csv", index=False, float_format=csv_float_format
     )
 
     # ── 6. annual demand by year, zone ────────────────────────────────────
@@ -2593,7 +2617,7 @@ def export_results_to_csv(
                     "peak_mw": float(load_df[zone].max()),
                 })
     pd.DataFrame(demand_rows).to_csv(
-        folder / f"{case_name}_demand_by_year.csv", index=False
+        folder / f"{case_name}_demand_by_year.csv", index=False, float_format=csv_float_format
     )
 
     # ── 7. link flows time series (one CSV per year) ───────────────────────
@@ -2603,7 +2627,8 @@ def export_results_to_csv(
         net = all_results[year]["network"]
         if not net.links_t.p0.empty:
             net.links_t.p0.to_csv(
-                flows_dir / f"{case_name}_link_flows_{year}.csv"
+                flows_dir / f"{case_name}_link_flows_{year}.csv",
+                float_format=csv_float_format,
             )
 
     # ── 8. CO2 emissions by year, carrier ─────────────────────────────────
@@ -2628,7 +2653,7 @@ def export_results_to_csv(
             if val != 0.0:
                 co2_rows.append({"year": year, "carrier": carrier, "co2_tons": val})
     pd.DataFrame(co2_rows).to_csv(
-        folder / f"{case_name}_co2_by_year.csv", index=False
+        folder / f"{case_name}_co2_by_year.csv", index=False, float_format=csv_float_format
     )
 
     print(f"  ✓ {case_name}_solver_summary.csv")

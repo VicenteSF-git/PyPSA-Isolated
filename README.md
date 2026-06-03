@@ -425,7 +425,7 @@ Projection rule:
 
 ### `general.csv` (optional)
 
-Global scenario settings only (for example `slack_cost_per_mwh`).
+Global scenario settings only (for example `slack_cost_per_mwh` or `hydro_capacity_factor`).
 Technology-specific costs and emissions should be in `costs.csv`.
 
 ### `hydrogen_assets.csv` (optional)

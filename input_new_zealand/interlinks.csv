@@ -1,10 +1,37 @@
 from_zone,to_zone,capacity_mw,loss_fraction,enabled
 # from_zone[name],to_zone[name],capacity_mw[MW],loss_fraction[fraction],enabled[bool]
-auckland,hamilton,2000,0.02,True
-hamilton,auckland,2000,0.02,True
-hamilton,wellington,1500,0.03,True
-wellington,hamilton,1500,0.03,True
-wellington,christchurch,1200,0.04,True
-christchurch,wellington,1200,0.04,True
-christchurch,dunedin,1000,0.03,True
-dunedin,christchurch,1000,0.03,True
+# North Island AC backbone
+northland,auckland,900,0.02,True
+auckland,northland,900,0.02,True
+auckland,waikato,2000,0.02,True
+waikato,auckland,2000,0.02,True
+waikato,bay_of_plenty,1200,0.02,True
+bay_of_plenty,waikato,1200,0.02,True
+waikato,taranaki,900,0.025,True
+taranaki,waikato,900,0.025,True
+waikato,manawatu_whanganui,1000,0.025,True
+manawatu_whanganui,waikato,1000,0.025,True
+manawatu_whanganui,hawkes_bay,900,0.025,True
+hawkes_bay,manawatu_whanganui,900,0.025,True
+bay_of_plenty,hawkes_bay,700,0.025,True
+hawkes_bay,bay_of_plenty,700,0.025,True
+taranaki,manawatu_whanganui,800,0.025,True
+manawatu_whanganui,taranaki,800,0.025,True
+manawatu_whanganui,wellington,1300,0.02,True
+wellington,manawatu_whanganui,1300,0.02,True
+# South Island AC backbone
+nelson,marlborough,900,0.02,True
+marlborough,nelson,900,0.02,True
+nelson,west_coast,700,0.03,True
+west_coast,nelson,700,0.03,True
+marlborough,canterbury,1200,0.02,True
+canterbury,marlborough,1200,0.02,True
+west_coast,canterbury,800,0.03,True
+canterbury,west_coast,800,0.03,True
+canterbury,otago,1300,0.02,True
+otago,canterbury,1300,0.02,True
+otago,southland,1000,0.02,True
+southland,otago,1000,0.02,True
+# Inter-island HVDC link (Cook Strait / Benmore-Haywards)
+wellington,canterbury,1200,0.035,True
+canterbury,wellington,1200,0.035,True

@@ -242,6 +242,13 @@ def load_generator_capacity_from_csv(
     - generator
     - zone
     - installed_capacity
+
+        Optional commissioning columns:
+        - available_from_year (flexible expansion start year)
+        - earliest_commissioning_year (alias for available_from_year)
+        - fixed_commissioning_year (if provided and model year reaches it,
+            the asset is treated as fixed capacity, not expandable)
+        - commissioning_type ('fixed' or 'flexible', optional hint)
     """
     csv_file = _resolve_csv_path(csv_path)
     if not csv_file.exists():
@@ -1112,6 +1119,13 @@ def _safe_float(value, default: float) -> float:
     return default if pd.isna(value) else float(value)
 
 
+def _safe_year(value) -> Optional[int]:
+    year = _safe_float(value, np.nan)
+    if not np.isfinite(year) or year <= 0:
+        return None
+    return int(year)
+
+
 def _previous_nominal_capacity(previous_year_network, component: str, asset_id: str, default: float) -> float:
     """Read previous optimized capacity if available, then fallback to nominal capacity."""
     table = getattr(previous_year_network, component)
@@ -1165,6 +1179,8 @@ def build_case_network(
     n.set_snapshots(snapshots)
     model_year = int(year) if year is not None else int(snapshots[0].year)
     slack_cost_per_mwh = _resolve_slack_cost(slack_cost_per_mwh, general_settings=None, default=500.0)
+    hydro_capacity_factor = _safe_float((general_settings or {}).get("hydro_capacity_factor", np.nan), 0.45)
+    hydro_capacity_factor = float(np.clip(hydro_capacity_factor, 0.0, 1.0))
 
     _require_columns(nodes_df, ["zone"], Path("nodes_df"))
     zones = nodes_df["zone"].astype(str).tolist()
@@ -1440,8 +1456,29 @@ def build_case_network(
             marginal_cost = _safe_float(row.get("marginal_cost", np.nan), 0.0)
             efficiency = _safe_float(row.get("efficiency", np.nan), 1.0)
             p_min_mw = _safe_float(row.get("p_min_mw", 0), 0.0)
-            available_from_year = int(_safe_float(row.get("available_from_year", model_year), model_year))
-            expansion_allowed = model_year >= available_from_year
+            hydro_cf = _safe_float(
+                row.get("capacity_factor", np.nan),
+                _safe_float(row.get("availability_factor", np.nan), hydro_capacity_factor),
+            )
+            earliest_commissioning_year = _safe_year(row.get("earliest_commissioning_year", np.nan))
+            if earliest_commissioning_year is None:
+                earliest_commissioning_year = _safe_year(row.get("available_from_year", np.nan))
+            fixed_commissioning_year = _safe_year(row.get("fixed_commissioning_year", np.nan))
+
+            commissioning_type = str(row.get("commissioning_type", "")).strip().lower()
+            hinted_fixed = commissioning_type == "fixed"
+            fixed_defined = fixed_commissioning_year is not None or hinted_fixed
+
+            if fixed_defined:
+                fixed_year = fixed_commissioning_year if fixed_commissioning_year is not None else earliest_commissioning_year
+                if fixed_year is None:
+                    fixed_year = model_year
+                if model_year < fixed_year:
+                    continue
+                expansion_allowed = False
+            else:
+                expansion_allowed = earliest_commissioning_year is not None and model_year >= earliest_commissioning_year
+
             gen_id = f"{gen_name}_{zone}"
             use_unit_commitment = p_min_mw > 0 and installed_cap > 0
 
@@ -1482,6 +1519,8 @@ def build_case_network(
 
             if vre_profiles is not None and gen_name in vre_profiles and zone in vre_profiles[gen_name].columns:
                 attrs["p_max_pu"] = vre_profiles[gen_name][zone].values
+            elif gen_name.lower().startswith("hydro"):
+                attrs["p_max_pu"] = np.full(len(snapshots), hydro_cf)
 
             n.add("Generator", gen_id, **attrs)
 

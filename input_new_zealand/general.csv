@@ -1,3 +1,4 @@
 parameter,value,unit,enabled
 # parameter[name],value[number/text],unit[text],enabled[bool]
 slack_cost_per_mwh,1000,USD/MWh,TRUE
+hydro_capacity_factor,0.45,fraction,TRUE

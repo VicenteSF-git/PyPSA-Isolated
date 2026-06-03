@@ -1,7 +1,16 @@
 zone,annual_mean_mw,annual_heat_mean_mw,existing_gas_boiler_mw,installed_heat_pump_mw,allow_heat_pump,heat_pump_cop,gas_boiler_efficiency,lat,lon,enabled
 # zone[name],annual_mean_mw[MW],annual_heat_mean_mw[MW],existing_gas_boiler_mw[MW],installed_heat_pump_mw[MW],allow_heat_pump[bool],heat_pump_cop[MWth/MWel],gas_boiler_efficiency[fraction],lat[degrees],lon[degrees],enabled[bool]
-auckland,650.0,280.0,250.0,0.0,True,3.2,0.90,-36.8485,174.7633,True
-hamilton,220.0,90.0,80.0,0.0,True,3.2,0.90,-37.7870,175.2793,True
-wellington,420.0,190.0,170.0,0.0,True,3.1,0.90,-41.2866,174.7756,True
-christchurch,520.0,260.0,220.0,0.0,True,3.0,0.90,-43.5321,172.6362,True
-dunedin,160.0,85.0,70.0,0.0,True,2.9,0.90,-45.8788,170.5028,True
+northland,90.0,32.0,28.8,0.0,True,3.2,0.90,-35.72,174.32,True
+auckland,620.0,210.0,189.0,0.0,True,3.2,0.90,-36.85,174.76,True
+waikato,180.0,70.0,63.0,0.0,True,3.2,0.90,-37.78,175.28,True
+bay_of_plenty,130.0,52.0,46.8,0.0,True,3.2,0.90,-37.69,176.16,True
+taranaki,70.0,30.0,27.0,0.0,True,3.1,0.90,-39.06,174.08,True
+hawkes_bay,85.0,34.0,30.6,0.0,True,3.1,0.90,-39.49,176.91,True
+manawatu_whanganui,95.0,39.0,35.1,0.0,True,3.1,0.90,-40.35,175.61,True
+wellington,240.0,95.0,85.5,0.0,True,3.1,0.90,-41.29,174.78,True
+nelson,35.0,19.0,17.1,0.0,True,3.0,0.90,-41.27,173.28,True
+marlborough,30.0,17.0,15.3,0.0,True,3.0,0.90,-41.51,173.96,True
+west_coast,20.0,13.0,11.7,0.0,True,2.9,0.90,-42.45,171.21,True
+canterbury,290.0,170.0,153.0,0.0,True,2.9,0.90,-43.53,172.64,True
+otago,110.0,65.0,58.5,0.0,True,2.9,0.90,-45.03,170.15,True
+southland,45.0,30.0,27.0,0.0,True,2.8,0.90,-46.41,168.35,True

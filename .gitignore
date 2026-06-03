@@ -14,6 +14,7 @@ data/**/*.nc
 
 # Local data not for versioning
 datos_Cristiane/
+data_NZ/
 
 # Legacy explicit ignore kept for compatibility
 punta_arenas_2019.nc

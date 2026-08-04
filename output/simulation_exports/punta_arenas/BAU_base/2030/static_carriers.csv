@@ -1,7 +1,0 @@
-name,co2_emissions,color,nice_name,max_growth,max_relative_growth
-bess,0.0,,,inf,0.0
-electricity,0.0,,,inf,0.0
-ocgt,0.202,,,inf,0.0
-slack,0.0,,,inf,0.0
-solar,0.0,,,inf,0.0
-wind,0.0,,,inf,0.0

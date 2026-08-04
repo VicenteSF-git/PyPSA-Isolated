@@ -1,3 +1,0 @@
-scenario,paper_id,event_start,event_end,event_demand_mwh,wind_event_generation_mwh,solar_event_generation_mwh,bess_event_generation_mwh,h2_fuel_cell_event_generation_mwh,h2_turbine_event_generation_mwh,ocgt_event_generation_mwh,slack_event_generation_mwh
-RT_full,S4,2050-06-28,2050-07-06 23:00:00,35677.726979512634,6201.074968891056,12610.490916226292,10697.302187985355,0.0,0.0,13572.628838449506,0.0
-RH_full,S7,2050-06-28,2050-07-06 23:00:00,35677.726979512634,20516.73894970867,13417.533552427249,14104.31799537727,0.0,0.0,0.0,3463.8216617989124

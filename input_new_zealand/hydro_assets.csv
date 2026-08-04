@@ -1,0 +1,28 @@
+asset_id,model_type,profile_id,profile_kind,energy_capacity_mwh,initial_soc_pu,min_soc_pu,max_soc_pu,final_soc_pu,standing_loss,turbine_efficiency,enabled,notes
+hydro_run_of_river_canterbury_bush_stream_hydro_plant,availability_generator,ror_canterbury,availability_pu,,,,,,,,True,Future run-of-river candidate using CAN hydrology shape.
+hydro_run_of_river_canterbury_clarence_hydro_waiau_diversions,availability_generator,ror_canterbury,availability_pu,,,,,,,,True,Future run-of-river candidate using CAN hydrology shape.
+hydro_run_of_river_canterbury_potts_river_hydro,availability_generator,ror_canterbury,availability_pu,,,,,,,,True,Future run-of-river candidate using CAN hydrology shape.
+hydro_run_of_river_canterbury_rakaia_river_dam,availability_generator,ror_canterbury,availability_pu,,,,,,,,True,Future run-of-river candidate using CAN hydrology shape.
+hydro_run_of_river_marlborough_wairau_hydro_expansion,availability_generator,ror_marlborough,availability_pu,,,,,,,,True,Future run-of-river candidate using NEL hydrology shape.
+hydro_run_of_river_otago_clutha_river_beaumont_expansion,availability_generator,ror_otago,availability_pu,,,,,,,,True,Future run-of-river candidate using OTG hydrology shape.
+hydro_run_of_river_otago_clutha_river_luggate_expansion,availability_generator,ror_otago,availability_pu,,,,,,,,True,Future run-of-river candidate using OTG hydrology shape.
+hydro_run_of_river_otago_clutha_river_queensberry_expansion,availability_generator,ror_otago,availability_pu,,,,,,,,True,Future run-of-river candidate using OTG hydrology shape.
+hydro_run_of_river_otago_clutha_river_tuapeka_expansion,availability_generator,ror_otago,availability_pu,,,,,,,,True,Future run-of-river candidate using OTG hydrology shape.
+hydro_run_of_river_west_coast_matakitaki_river_generic_hydro_plant,availability_generator,ror_west_coast,availability_pu,,,,,,,,True,Future run-of-river candidate using NEL hydrology shape.
+hydro_run_of_river_west_coast_ngakawau_hydro_scheme,availability_generator,ror_west_coast,availability_pu,,,,,,,,True,Future run-of-river candidate using NEL hydrology shape.
+hydro_run_of_river_west_coast_taramakau,availability_generator,ror_west_coast,availability_pu,,,,,,,,True,Future run-of-river candidate using NEL hydrology shape.
+hydro_run_of_river_west_coast_whitcombe_river,availability_generator,ror_west_coast,availability_pu,,,,,,,,True,Future run-of-river candidate using NEL hydrology shape.
+hydro_storage_bay_of_plenty_bay_of_plenty_hydro_scheme_embedded,inflow_generator,hydro_storage_bay_of_plenty_bay_of_plenty_hydro_scheme_embedded,inflow_mw,,,,,,,,True,Existing non-reservoir hydro represented as inflow-limited generation.
+hydro_storage_bay_of_plenty_bay_of_plenty_hydro_schemes,inflow_generator,hydro_storage_bay_of_plenty_bay_of_plenty_hydro_schemes,inflow_mw,,,,,,,,True,Existing non-reservoir hydro represented as inflow-limited generation.
+hydro_storage_canterbury_christchurch_hydro_scheme_embedded,inflow_generator,hydro_storage_canterbury_christchurch_hydro_scheme_embedded,inflow_mw,,,,,,,,True,Existing non-reservoir hydro represented as inflow-limited generation.
+hydro_storage_canterbury_coleridge,inflow_generator,hydro_storage_canterbury_coleridge,inflow_mw,,,,,,,,True,Existing non-reservoir hydro represented as inflow-limited generation.
+hydro_storage_canterbury_waitaki_hydro_scheme,reservoir,hydro_storage_canterbury_waitaki_hydro_scheme,inflow_mw,2517242.898055555,0.884908677,0.000000000,1.000000000,0.884908677,0.000000000,1.000000000,True,Aggregated reservoir; normal operating storage only; no contingency storage.
+hydro_storage_hawkes_bay_waikaremoana_hydro_scheme,reservoir,hydro_storage_hawkes_bay_waikaremoana_hydro_scheme,inflow_mw,154263.472222222,0.770012731,0.000000000,1.000000000,0.770012731,0.000000000,1.000000000,True,Aggregated reservoir; normal operating storage only; no contingency storage.
+hydro_storage_manawatu_whanganui_mangahao,inflow_generator,hydro_storage_manawatu_whanganui_mangahao,inflow_mw,,,,,,,,True,Existing non-reservoir hydro represented as inflow-limited generation.
+hydro_storage_nelson_cobb,inflow_generator,hydro_storage_nelson_cobb,inflow_mw,,,,,,,,True,Existing non-reservoir hydro represented as inflow-limited generation.
+hydro_storage_otago_clyde_and_roxburgh_hydro_scheme,reservoir,hydro_storage_otago_clyde_and_roxburgh_hydro_scheme,inflow_mw,291736.504166667,0.890991725,0.000000000,1.000000000,0.890991725,0.000000000,1.000000000,True,Aggregated reservoir; normal operating storage only; no contingency storage.
+hydro_storage_otago_waipori_power_scheme,inflow_generator,hydro_storage_otago_waipori_power_scheme,inflow_mw,,,,,,,,True,Existing non-reservoir hydro represented as inflow-limited generation.
+hydro_storage_southland_manapouri,reservoir,hydro_storage_southland_manapouri,inflow_mw,437823.006111111,0.730074910,0.000000000,1.000000000,0.730074910,0.000000000,1.000000000,True,Aggregated reservoir; normal operating storage only; no contingency storage.
+hydro_storage_taranaki_patea,inflow_generator,hydro_storage_taranaki_patea,inflow_mw,,,,,,,,True,Existing non-reservoir hydro represented as inflow-limited generation.
+hydro_storage_waikato_bunnythorpe_hydro_scheme,inflow_generator,hydro_storage_waikato_bunnythorpe_hydro_scheme,inflow_mw,,,,,,,,True,Existing non-reservoir hydro represented as inflow-limited generation.
+hydro_storage_waikato_waikato_river_hydro_scheme,reservoir,hydro_storage_waikato_waikato_river_hydro_scheme,inflow_mw,587137.055555556,0.873418284,0.000000000,1.000000000,0.873418284,0.000000000,1.000000000,True,Aggregated reservoir; normal operating storage only; no contingency storage.

@@ -1,5 +1,4 @@
-generator,zone,technology,capital_cost,marginal_cost,efficiency,installed_capacity,p_min_mw,available_from_year
-# generator[name],zone[name],technology[name],capital_cost[USD/MW/yr],marginal_cost[USD/MWh],efficiency[fraction],installed_capacity[MW],p_min_mw[MW],available_from_year[year]
-wind,punta_arenas_2,wind,110000,0,1,0,0,2030
-solar,punta_arenas_2,solar,60000,0,1,0,0,2030
-ocgt,punta_arenas_2,ocgt,45000,140,0.38,80,0,2025
+asset_id,generator,technology,zone,installed_capacity,capital_cost,marginal_cost,efficiency,p_min_mw,capacity_factor,available_from_year,earliest_commissioning_year,fixed_commissioning_year,commissioning_type,enabled,source_tech_count,source
+diesel_planta_sjb_existing,diesel_existing,diesel,planta_electrica_sjb,0.88,0,,,0,,2025,,2025,fixed,TRUE,2,EEL Juan Fernandez 2026: two Cummins C550D5 generator sets of 440 kW each
+solar_planta_sjb_candidate,solar_candidate,solar,planta_electrica_sjb,10,,,,0,,2030,2030,,flexible,TRUE,1,Planning upper bound; EEL identifies a 1.5 ha candidate site but does not provide a reliable grid-connected MW limit
+wind_planta_sjb_candidate,wind_candidate,wind,planta_electrica_sjb,3,,,,0,,2030,2030,,flexible,TRUE,1,EEL Juan Fernandez 2026 recommends one 225 kW medium-scale wind turbine

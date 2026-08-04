@@ -1,9 +1,19 @@
 technology,year,base_year,capital_cost,marginal_cost,efficiency,max_hours,efficiency_store,efficiency_dispatch,standing_loss,co2_emissions,annual_change,capital_cost_annual_change,marginal_cost_annual_change,co2_emissions_annual_change
-# technology[name],year[optional],base_year[optional],capital_cost[USD/MW/yr],marginal_cost[USD/MWh],efficiency[fraction],max_hours[hours],efficiency_store[fraction],efficiency_dispatch[fraction],standing_loss[fraction/hour],co2_emissions[tCO2/MWh],annual_change[decimal_or_%],capital_cost_annual_change[decimal_or_%],marginal_cost_annual_change[decimal_or_%],co2_emissions_annual_change[decimal_or_%]
 wind,2030,2030,110000,0,1,,,,,0,,-0.01,,
 solar,2030,2030,60000,0,1,,,,,0,,-0.02,,
 ocgt,2030,2030,45000,140,0.38,,,,,0.202,,,0.015,
 bess,2030,2030,75000,0,,4,0.95,0.95,0.001,0,,-0.015,,
-natural_gas,2030,2030,0,45,1,,,,,0.202,,,0.02,0
-gas_boiler,2030,2030,0,0,0.90,,,,,0,,,,
-heat_pump,2030,2030,65000,0,3.0,,,,,0,,-0.01,,
+natural_gas,2030,2030,0,45,1,,,,,0.202,,,0.02,
+gas_boiler,2030,2030,0,0,0.9,,,,,0,,,,
+heat_pump,2030,2030,65000,0,3,,,,,0,,-0.01,,
+asu,2030,2030,50000,0,5,,,,,0,,-0.01,,
+dac,2030,2030,150000,0,1,,,,,0,,-0.01,,
+ammonia_synthesis,2030,2030,120000,0,0.169491525,,,,,0,,-0.005,,
+methanol_synthesis,2030,2030,130000,0,0.16,,,,,0,,-0.005,,
+ammonia_storage,2030,2030,80,0,,,,,0,0,,,,
+methanol_storage,2030,2030,60,0,,,,,0,0,,,,
+ccgt,2030,2030,,,0.48,,,,,0.202,,,,
+gas_peaker,2030,2030,,,0.36,,,,,0.202,,,,
+gas_cogeneration,2030,2030,,,0.39,,,,,0.202,,,,
+coal,2030,2030,,,0.33,,,,,0.341,,,,
+diesel_peaker,2030,2030,,,0.33,,,,,0.267,,,,

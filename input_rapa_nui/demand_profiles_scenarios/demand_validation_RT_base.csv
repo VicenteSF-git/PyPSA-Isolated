@@ -1,0 +1,2 @@
+demand_type,zone,source,rows,annual_total_mwh,monthly_total_mwh_sum,mean_mw,min_mw,max_mw
+electricity,hanga_roa,csv,8760,13346.0,13345.999999999998,1.5235159817351598,1.11447625,2.03400082

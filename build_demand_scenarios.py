@@ -288,12 +288,39 @@ def _default_profile_for_component(
         values = 0.25 + 1.75 * evening_peak
         return pd.Series(values * weekend_shift, index=snapshots)
 
+    #if component == "heating":
+    #    winter_factor = np.where(np.isin(month, [5, 6, 7, 8, 9]), 1.8, 0.6)
+    #    daily_shape = 0.55 + 0.45 * np.exp(-0.5 * ((h - 7) / 3.0) ** 2) + 0.35 * np.exp(
+    #        -0.5 * ((h - 20) / 3.5) ** 2
+    #    )
+    #    return pd.Series(winter_factor * daily_shape, index=snapshots)
     if component == "heating":
-        winter_factor = np.where(np.isin(month, [5, 6, 7, 8, 9]), 1.8, 0.6)
-        daily_shape = 0.55 + 0.45 * np.exp(-0.5 * ((h - 7) / 3.0) ** 2) + 0.35 * np.exp(
-            -0.5 * ((h - 20) / 3.5) ** 2
+        # Day of year: 1–365/366
+        doy = snapshots.dayofyear
+
+        # Heating peak around mid-July in Southern Hemisphere
+        peak_day = 196  # ~15 July
+
+        # Smooth annual heating seasonality.
+        # min_factor = heating demand in summer relative to annual average-ish
+        # max_factor = heating demand in winter
+        min_factor = 0.75
+        max_factor = 1.65
+
+        seasonal_shape = (
+            min_factor
+            + (max_factor - min_factor)
+            * 0.5
+            * (1 + np.cos(2 * np.pi * (doy - peak_day) / 365.25))
         )
-        return pd.Series(winter_factor * daily_shape, index=snapshots)
+
+        daily_shape = (
+            0.55
+            + 0.45 * np.exp(-0.5 * ((h - 7) / 3.0) ** 2)
+            + 0.35 * np.exp(-0.5 * ((h - 20) / 3.5) ** 2)
+        )
+
+        return pd.Series(seasonal_shape * daily_shape, index=snapshots)
 
     if component == "cooking":
         breakfast = np.exp(-0.5 * ((h - 8) / 1.5) ** 2)
@@ -525,18 +552,26 @@ def write_scenario_outputs(
     scenario: str,
     aggregated_df: pd.DataFrame,
     component_df: pd.DataFrame,
+    output_subfolder: str | Path = "demand_profiles_scenarios",
 ) -> Tuple[Path, Path]:
     """Write demand_profiles_{scenario}.csv and demand_components_{scenario}.csv.
 
     All years for the scenario are written together in a single file each.
+    By default, scenario demand files are stored under
+    input_case_folder / demand_profiles_scenarios so that the case input folder
+    keeps only the base demand profile and static input tables.
+
     The existing build_demands() loader in build_demand.py filters by timestamp
     range automatically, so each run_case(year=...) call picks up only the
     relevant year from the combined file.
     """
     case_folder = _resolve_path(input_case_folder)
+    subfolder = Path(output_subfolder)
+    output_folder = subfolder if subfolder.is_absolute() else case_folder / subfolder
+    output_folder.mkdir(parents=True, exist_ok=True)
 
-    demand_profiles_path = case_folder / f"demand_profiles_{scenario}.csv"
-    demand_components_path = case_folder / f"demand_components_{scenario}.csv"
+    demand_profiles_path = output_folder / f"demand_profiles_{scenario}.csv"
+    demand_components_path = output_folder / f"demand_components_{scenario}.csv"
 
     aggregated_df = (
         aggregated_df[["timestamp", "zone", "demand_type", "demand_mw"]]
@@ -554,10 +589,17 @@ def write_scenario_outputs(
     return demand_profiles_path, demand_components_path
 
 
-def write_summary(input_case_folder: str | Path, summary_df: pd.DataFrame) -> Path:
-    """Write global scenario summary under input_case folder."""
+def write_summary(
+    input_case_folder: str | Path,
+    summary_df: pd.DataFrame,
+    output_subfolder: str | Path = "demand_profiles_scenarios",
+) -> Path:
+    """Write global scenario summary under the scenario-demand folder."""
     case_folder = _resolve_path(input_case_folder)
-    out_path = case_folder / "demand_scenario_summary.csv"
+    subfolder = Path(output_subfolder)
+    output_folder = subfolder if subfolder.is_absolute() else case_folder / subfolder
+    output_folder.mkdir(parents=True, exist_ok=True)
+    out_path = output_folder / "demand_scenario_summary.csv"
     summary_df = summary_df[
         [
             "scenario",
@@ -604,7 +646,15 @@ def main() -> None:
     parser.add_argument(
         "--input-case",
         default="input_punta_arenas",
-        help="Case folder where scenarios output will be written.",
+        help="Case folder where scenario outputs will be written.",
+    )
+    parser.add_argument(
+        "--output-subfolder",
+        default="demand_profiles_scenarios",
+        help=(
+            "Subfolder under --input-case where scenario demand CSVs are written "
+            "(default: demand_profiles_scenarios). Use an absolute path to write elsewhere."
+        ),
     )
     parser.add_argument(
         "--base-demand-csv",
@@ -631,8 +681,8 @@ def main() -> None:
         "--years",
         nargs="*",
         type=int,
-        default=[2030, 2040, 2050],
-        help="Scenario years to generate. Defaults: 2030 2040 2050",
+        default=[2025, 2030, 2040, 2050],
+        help="Scenario years to generate. Defaults: 2025 2030 2040 2050",
     )
     args = parser.parse_args()
 
@@ -666,14 +716,19 @@ def main() -> None:
             scenario=scenario,
             aggregated_df=all_agg,
             component_df=all_comp,
+            output_subfolder=args.output_subfolder,
         )
-        print(f"  {profiles_path.name}")
-        print(f"  {components_path.name}")
+        print(f"  {profiles_path.relative_to(_resolve_path(args.input_case))}")
+        print(f"  {components_path.relative_to(_resolve_path(args.input_case))}")
 
     if all_summary:
         summary_all_df = pd.concat(all_summary, ignore_index=True)
-        summary_path = write_summary(args.input_case, summary_all_df)
-        print(f"  {summary_path.name}")
+        summary_path = write_summary(
+            args.input_case,
+            summary_all_df,
+            output_subfolder=args.output_subfolder,
+        )
+        print(f"  {summary_path.relative_to(_resolve_path(args.input_case))}")
 
 
 if __name__ == "__main__":

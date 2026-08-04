@@ -1,0 +1,2 @@
+demand_type,zone,source,rows,annual_total_mwh,monthly_total_mwh_sum,mean_mw,min_mw,max_mw
+electricity,san_juan_bautista,csv,8760,1874.256,1874.256,0.21395616438356166,0.15651235,0.2856465

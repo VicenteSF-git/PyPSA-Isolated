@@ -1,0 +1,3 @@
+asset_id,generator,technology,zone,installed_capacity,capital_cost,marginal_cost,efficiency,p_min_mw,capacity_factor,available_from_year,earliest_commissioning_year,fixed_commissioning_year,commissioning_type,enabled,source_tech_count,source
+diesel_mataveri_existing,diesel_existing,diesel,mataveri,6.16,0,,,0,,2025,,2025,fixed,TRUE,7,SASIPA 2025: seven diesel generator sets and 6.160 MW effective capacity
+solar_mataveri_existing,solar_existing,solar,mataveri,0.105,0,,,0,,2025,,2025,fixed,TRUE,1,SASIPA 2025: 105 kW renewable capacity at Mataveri

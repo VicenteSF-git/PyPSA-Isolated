@@ -1,4 +1,3 @@
-from_zone,to_zone,capacity_mw,loss_fraction,enabled
-# from_zone[name],to_zone[name],capacity_mw[MW],loss_fraction[fraction],enabled[bool]
-punta_arenas_1,punta_arenas_2,1000,0.0,True
-punta_arenas_2,punta_arenas_1,1000,0.0,True
+asset_id,from_zone,to_zone,capacity_mw,loss_fraction,expandable,discrete_expansion,module_capacity_mw,min_modules,max_modules,max_capacity_mw,capital_cost,marginal_cost,p_min_pu,bidirectional,enabled,source
+planta_sjb_to_san_juan_bautista_existing,planta_electrica_sjb,san_juan_bautista,0.88,0.02,FALSE,FALSE,,0,0,0.88,0,0,0,FALSE,TRUE,Generation capacity used as a corridor proxy; 2 percent distribution loss is a planning assumption
+planta_sjb_to_san_juan_bautista_expansion,planta_electrica_sjb,san_juan_bautista,0,0.02,TRUE,TRUE,0.25,0,4,1,80000,0,0,FALSE,TRUE,Planning assumption for modular medium-voltage expansion

@@ -1,0 +1,2 @@
+asset_id,generator,technology,zone,installed_capacity,capital_cost,marginal_cost,efficiency,p_min_mw,capacity_factor,available_from_year,earliest_commissioning_year,fixed_commissioning_year,commissioning_type,enabled,source_tech_count,source
+diesel_planta_sjb_existing,diesel_existing,diesel,planta_electrica_sjb,0.88,0,,,0,,2025,,2025,fixed,TRUE,2,EEL Juan Fernandez 2026: two Cummins C550D5 generator sets of 440 kW each

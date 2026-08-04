@@ -1,3 +1,10 @@
-parameter,value,unit,enabled
-# parameter[name],value[number/text],unit[text],enabled[bool]
-slack_cost_per_mwh,1000,USD/MWh,TRUE
+parameter,value,enabled,description,source
+slack_cost_per_mwh,100000,TRUE,Penalty for unserved electricity demand in USD/MWh,PyPSA-Isolated modelling assumption
+currency,USD,TRUE,Model reporting currency,Case convention
+currency_year,2025,TRUE,Reference currency year,Case convention
+annual_external_demand_mwh,13346,TRUE,Electricity sold to external customers in 2024,SASIPA Memoria Corporativa 2025
+demand_reference_year,2024,TRUE,Year represented by the observed annual electricity demand,SASIPA Memoria Corporativa 2025
+reported_generation_mwh,16768,TRUE,Total electricity generated in 2024,SASIPA Memoria Corporativa 2025
+reported_internal_consumption_mwh,1437,TRUE,SASIPA internal electricity consumption excluded from model demand,SASIPA Memoria Corporativa 2025
+network_loss_fraction,0.12,TRUE,Reported electricity-network losses represented in interlinks.csv,SASIPA Memoria Corporativa 2025
+h2_lhv_mwh_per_ton,33.33,TRUE,Hydrogen lower heating value used for reporting,Standard conversion

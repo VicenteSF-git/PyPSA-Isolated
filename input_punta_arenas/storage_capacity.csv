@@ -1,3 +1,9 @@
-zone,installed_power_mw,max_hours,capital_cost,marginal_cost,efficiency_store,efficiency_dispatch,standing_loss,available_from_year
-# zone[name],installed_power_mw[MW],max_hours[hours],capital_cost[USD/MW/yr],marginal_cost[USD/MWh],efficiency_store[fraction],efficiency_dispatch[fraction],standing_loss[fraction/hour],available_from_year[year]
-punta_arenas_2,0,4,75000,0,0.95,0.95,0.001,2030
+asset_id,storage,zone,technology,installed_power_mw,p_nom_max_mw,max_hours,capital_cost,marginal_cost,efficiency_store,efficiency_dispatch,standing_loss,available_from_year,earliest_commissioning_year,fixed_commissioning_year,commissioning_type,enabled,source_tech_count
+bess_2h_cabo_negro,bess_2h,cabo_negro,bess,0,500,2,55000,0,0.95,0.95,0.001,2030,2030,,flexible,FALSE,1
+bess_4h_cabo_negro,bess_4h,cabo_negro,bess,0,1500,4,75000,0,0.95,0.95,0.001,2030,2030,,flexible,TRUE,1
+bess_6h_cabo_negro,bess_6h,cabo_negro,bess,0,750,6,95000,0,0.95,0.95,0.001,2030,2030,,flexible,FALSE,1
+bess_8h_cabo_negro,bess_8h,cabo_negro,bess,0,750,8,115000,0,0.95,0.95,0.001,2030,2030,,flexible,TRUE,1
+bess_2h_puerto_tranquilo_sur,bess_2h,puerto_tranquilo_sur,bess,0,500,2,55000,0,0.95,0.95,0.001,2030,2030,,flexible,FALSE,1
+bess_4h_puerto_tranquilo_sur,bess_4h,puerto_tranquilo_sur,bess,0,1500,4,75000,0,0.95,0.95,0.001,2030,2030,,flexible,TRUE,1
+bess_6h_puerto_tranquilo_sur,bess_6h,puerto_tranquilo_sur,bess,0,750,6,95000,0,0.95,0.95,0.001,2030,2030,,flexible,FALSE,1
+bess_8h_puerto_tranquilo_sur,bess_8h,puerto_tranquilo_sur,bess,0,750,8,115000,0,0.95,0.95,0.001,2030,2030,,flexible,TRUE,1

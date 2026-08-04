@@ -28,7 +28,11 @@ DEFAULT_PATHS = {
     "interlinks_csv": "input_magallanes/interlinks.csv",
     "capacity_csv": "input_magallanes/generators_capacity.csv",
     "storage_csv": "input_magallanes/storage_capacity.csv",
+    "hydro_assets_csv": "input_magallanes/hydro_assets.csv",
+    "hydro_inflows_csv": "input_magallanes/hydro_inflows.csv",
     "hydrogen_csv": "input_magallanes/hydrogen_assets.csv",
+    "ptx_assets_csv": "input_magallanes/ptx_assets.csv",
+    "ptx_monthly_demand_csv": "input_magallanes/ptx_monthly_demand.csv",
     "costs_csv": "input_magallanes/costs.csv",
     "general_csv": "input_magallanes/general.csv",
     "demand_csv": "input_magallanes/demand_profiles.csv",
@@ -126,7 +130,11 @@ def get_case_paths(case_folder: str = "input_magallanes") -> dict:
         "csv_interlinks": f"{case_folder}/interlinks.csv",
         "csv_capacity": f"{case_folder}/generators_capacity.csv",
         "csv_storage": f"{case_folder}/storage_capacity.csv",
+        "csv_hydro_assets": f"{case_folder}/hydro_assets.csv",
+        "csv_hydro_inflows": f"{case_folder}/hydro_inflows.csv",
         "csv_hydrogen": f"{case_folder}/hydrogen_assets.csv",
+        "csv_ptx_assets": f"{case_folder}/ptx_assets.csv",
+        "csv_ptx_monthly_demand": f"{case_folder}/ptx_monthly_demand.csv",
         "csv_costs": f"{case_folder}/costs.csv",
         "csv_general": f"{case_folder}/general.csv",
         "csv_demand": f"{case_folder}/demand_profiles.csv",
@@ -140,6 +148,83 @@ def _resolve_csv_path(preferred_path: str) -> Path:
     if preferred.is_absolute():
         return preferred
     return PROJECT_DIR / preferred
+
+
+def _case_folder_from_csv_nodes(csv_nodes: str) -> Path:
+    """Infer the case input folder from the nodes CSV path."""
+    nodes_path = _resolve_csv_path(csv_nodes)
+    return nodes_path.parent
+
+
+def _resolve_demand_csv_path(csv_demand: str, csv_nodes: str) -> str:
+    """Resolve demand CSVs, including scenario files stored in demand_profiles_scenarios.
+
+    Supported inputs include:
+    - input_punta_arenas/demand_profiles.csv
+    - input_punta_arenas/demand_profiles_scenarios/demand_profiles_RH_full_ptx.csv
+    - input_punta_arenas/demand_profiles_RH_full_ptx.csv  # legacy location
+    - RH_full_ptx  # scenario-code shortcut
+
+    Scenario files are preferentially resolved inside demand_profiles_scenarios so
+    stale copies in the case-folder root do not silently override newer scenario files.
+    """
+    if csv_demand is None:
+        return csv_demand
+
+    raw = str(csv_demand).strip()
+    if raw == "":
+        return raw
+
+    case_folder = _case_folder_from_csv_nodes(csv_nodes)
+    scenario_folder = case_folder / "demand_profiles_scenarios"
+    candidate = Path(raw)
+    candidate_abs = candidate if candidate.is_absolute() else PROJECT_DIR / candidate
+
+    # Scenario-code shortcut: csv_demand="RH_full_ptx"
+    if candidate.suffix.lower() != ".csv" and len(candidate.parts) == 1:
+        scenario_file = scenario_folder / f"demand_profiles_{raw}.csv"
+        if scenario_file.exists():
+            return str(scenario_file)
+
+    # Legacy root path or bare filename: demand_profiles_RH_full_ptx.csv
+    # Prefer the scenario subfolder even if an old file exists in the case-folder root.
+    if candidate.name.startswith("demand_profiles_") and candidate.name.endswith(".csv"):
+        scenario_file = scenario_folder / candidate.name
+        if scenario_file.exists():
+            return str(scenario_file)
+
+    # Bare filename: any .csv inside demand_profiles_scenarios
+    if len(candidate.parts) == 1 and candidate.suffix.lower() == ".csv":
+        scenario_file = scenario_folder / candidate.name
+        if scenario_file.exists():
+            return str(scenario_file)
+
+    if candidate_abs.exists():
+        return str(candidate_abs)
+
+    return str(candidate_abs)
+
+
+def _resolve_demand_summary_csv_path(csv_demand_summary: Optional[str], resolved_csv_demand: str) -> Optional[str]:
+    """Place scenario demand-validation summaries next to their demand profile."""
+    if csv_demand_summary is None:
+        return None
+
+    raw_summary = str(csv_demand_summary).strip()
+    demand_path = Path(resolved_csv_demand)
+
+    if demand_path.name.startswith("demand_profiles_"):
+        scenario_code = demand_path.stem.replace("demand_profiles_", "", 1)
+        return str(demand_path.parent / f"demand_validation_{scenario_code}.csv")
+
+    summary_candidate = Path(raw_summary)
+    if summary_candidate.is_absolute():
+        return str(summary_candidate)
+
+    if demand_path.parent.name == "demand_profiles_scenarios":
+        return str(demand_path.parent / summary_candidate.name)
+
+    return raw_summary
 
 
 def _read_csv(csv_file: Path) -> pd.DataFrame:
@@ -207,6 +292,25 @@ def load_interlinks_from_csv(
 
     Optional columns:
     - enabled
+    - asset_id
+    - expandable
+    - discrete_expansion
+    - module_capacity_mw
+    - min_modules
+    - max_modules
+    - max_capacity_mw
+    - capital_cost
+    - marginal_cost
+    - p_min_pu
+    - bidirectional
+
+    Notes
+    -----
+    capacity_mw is interpreted as existing/fixed transfer capacity. If
+    expandable=TRUE, additional capacity can be built up to the specified
+    continuous or modular limit. If discrete_expansion=TRUE, the optimized
+    p_nom is forced to:
+        existing_capacity_mw + module_capacity_mw * integer_modules
     """
     csv_file = _resolve_csv_path(csv_path)
     if not csv_file.exists():
@@ -216,16 +320,44 @@ def load_interlinks_from_csv(
     _require_columns(df, ["from_zone", "to_zone", "capacity_mw", "loss_fraction"], csv_file)
 
     if "enabled" in df.columns:
-        df = df[df["enabled"] == True].copy()  # noqa: E712
+        df = df[df["enabled"].map(lambda v: _as_bool(v, default=True))].copy()
 
     interlinks = []
     for _, row in df.iterrows():
+        from_zone = str(row["from_zone"]).strip()
+        to_zone = str(row["to_zone"]).strip()
+        default_asset_id = f"link_{from_zone}_to_{to_zone}"
+
+        expandable = _as_bool(row.get("expandable", False), default=False)
+        module_capacity_mw = _safe_float(row.get("module_capacity_mw", np.nan), np.nan)
+        discrete_expansion = _as_bool(
+            row.get("discrete_expansion", False),
+            default=bool(expandable and np.isfinite(module_capacity_mw) and module_capacity_mw > 0),
+        )
+        bidirectional = _as_bool(row.get("bidirectional", False), default=False)
+        # Do not represent bidirectional links with p_min_pu < 0.
+        # Negative p0 can create artificial negative objective contributions when
+        # marginal_cost > 0. Bidirectional corridors are represented later as
+        # two directed links with shared capacity.
+        p_min_default = 0.0
+
         interlinks.append(
             {
-                "from_zone": row["from_zone"],
-                "to_zone": row["to_zone"],
-                "capacity_mw": row["capacity_mw"],
-                "loss_fraction": row["loss_fraction"],
+                "asset_id": _normalize_label(row.get("asset_id", default_asset_id), default=default_asset_id),
+                "from_zone": from_zone,
+                "to_zone": to_zone,
+                "capacity_mw": _safe_float(row.get("capacity_mw", 0.0), 0.0),
+                "loss_fraction": _safe_float(row.get("loss_fraction", 0.0), 0.0),
+                "expandable": expandable,
+                "discrete_expansion": discrete_expansion,
+                "module_capacity_mw": module_capacity_mw,
+                "min_modules": _safe_float(row.get("min_modules", 0.0), 0.0),
+                "max_modules": _safe_float(row.get("max_modules", np.nan), np.nan),
+                "max_capacity_mw": _safe_float(row.get("max_capacity_mw", np.nan), np.nan),
+                "capital_cost": _safe_float(row.get("capital_cost", 0.0), 0.0),
+                "marginal_cost": _safe_float(row.get("marginal_cost", 0.0), 0.0),
+                "p_min_pu": _safe_float(row.get("p_min_pu", p_min_default), p_min_default),
+                "bidirectional": bidirectional,
             }
         )
 
@@ -236,19 +368,25 @@ def load_generator_capacity_from_csv(
     csv_path: str = DEFAULT_PATHS["capacity_csv"],
 ) -> Optional[pd.DataFrame]:
     """
-    Load generator capacities and costs from CSV.
+    Load generator capacities, technology labels, costs and commissioning metadata.
 
     Required columns:
-    - generator
-    - zone
-    - installed_capacity
+    - generator: asset/candidate name. This is an identifier, not necessarily a technology.
+    - zone: model node/zone.
+    - installed_capacity: MW. For fixed assets this is existing/committed capacity;
+      for flexible assets this is the maximum buildable capacity in the model year.
 
-        Optional commissioning columns:
-        - available_from_year (flexible expansion start year)
-        - earliest_commissioning_year (alias for available_from_year)
-        - fixed_commissioning_year (if provided and model year reaches it,
-            the asset is treated as fixed capacity, not expandable)
-        - commissioning_type ('fixed' or 'flexible', optional hint)
+    Recommended columns:
+    - technology: physical technology/carrier used for costs, emissions and VRE profiles
+      (e.g. solar, wind, diesel, gas, hydro). If omitted, generator is used as fallback.
+    - asset_id: optional unique PyPSA generator id. If omitted, ``generator_zone`` is used.
+    - enabled: optional TRUE/FALSE switch.
+
+    Optional commissioning columns:
+    - commissioning_type: fixed/existing/committed or flexible/candidate/extendable.
+    - available_from_year / earliest_commissioning_year: first year a flexible
+      candidate can be built.
+    - fixed_commissioning_year: first year a fixed/committed asset exists.
     """
     csv_file = _resolve_csv_path(csv_path)
     if not csv_file.exists():
@@ -256,18 +394,189 @@ def load_generator_capacity_from_csv(
 
     df = _read_csv(csv_file)
     _require_columns(df, ["generator", "zone", "installed_capacity"], csv_file)
-    return df
+
+    if "enabled" in df.columns:
+        df = df[df["enabled"].map(lambda v: _as_bool(v, default=True))].copy()
+
+    if "technology" not in df.columns:
+        df["technology"] = df["generator"]
+    else:
+        technology_missing = df["technology"].isna() | (df["technology"].astype(str).str.strip() == "")
+        df.loc[technology_missing, "technology"] = df.loc[technology_missing, "generator"]
+
+    df["generator"] = df["generator"].astype(str).str.strip()
+    df["zone"] = df["zone"].astype(str).str.strip()
+    df["technology"] = df["technology"].map(_normalize_label)
+
+    return df.reset_index(drop=True)
 
 
 def load_storage_capacity_from_csv(
     csv_path: str = DEFAULT_PATHS["storage_csv"],
 ) -> Optional[pd.DataFrame]:
-    """Load storage parameters from CSV."""
+    """Load storage parameters from CSV.
+
+    The table follows the same commissioning logic as generators_capacity.csv:
+    fixed/existing rows are added as exogenous capacity, while flexible/candidate
+    rows become endogenous expansion options once available_from_year is reached.
+
+    Recommended columns:
+    - asset_id: unique PyPSA StorageUnit id.
+    - storage: asset/candidate name, e.g. bess_4h.
+    - zone: model node/zone.
+    - technology: carrier label, usually bess.
+    - installed_power_mw: existing/fixed power capacity. For flexible rows this is
+      the initial/minimum capacity, normally 0.
+    - max_power_mw or p_nom_max_mw: optional upper bound for flexible expansion.
+    - max_hours: energy-to-power ratio.
+    - commissioning_type, available_from_year, earliest_commissioning_year,
+      fixed_commissioning_year, enabled.
+    """
     csv_file = _resolve_csv_path(csv_path)
     if not csv_file.exists():
         return None
 
-    return _read_csv(csv_file)
+    df = _read_csv(csv_file)
+    if df.empty:
+        return df
+
+    _require_columns(df, ["zone", "installed_power_mw", "max_hours"], csv_file)
+
+    if "enabled" in df.columns:
+        df = df[df["enabled"].map(lambda v: _as_bool(v, default=True))].copy()
+
+    if "technology" not in df.columns:
+        df["technology"] = "bess"
+    else:
+        technology_missing = df["technology"].isna() | (df["technology"].astype(str).str.strip() == "")
+        df.loc[technology_missing, "technology"] = "bess"
+
+    if "storage" not in df.columns:
+        df["storage"] = df["technology"]
+
+    df["zone"] = df["zone"].astype(str).str.strip()
+    df["technology"] = df["technology"].map(_normalize_label)
+    df["storage"] = df["storage"].map(_normalize_label)
+
+    return df.reset_index(drop=True)
+
+
+def load_hydro_assets_from_csv(
+    csv_path: str = DEFAULT_PATHS["hydro_assets_csv"],
+) -> Optional[pd.DataFrame]:
+    """Load optional CSV-driven hydro representations.
+
+    The file links to ``generators_capacity.csv`` through ``asset_id`` and only
+    overrides hydro rows explicitly listed in it. Cases without this file keep
+    the previous hydro-capacity-factor behaviour unchanged.
+    """
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return None
+
+    df = _read_csv(csv_file)
+    if df.empty:
+        return df
+
+    _require_columns(df, ["asset_id", "model_type", "profile_id"], csv_file)
+    if "enabled" in df.columns:
+        df = df[df["enabled"].map(lambda value: _as_bool(value, default=True))].copy()
+
+    df["asset_id"] = df["asset_id"].astype(str).str.strip()
+    df["model_type"] = df["model_type"].map(_normalize_label)
+    df["profile_id"] = df["profile_id"].astype(str).str.strip()
+
+    allowed_types = {"reservoir", "inflow_generator", "availability_generator"}
+    unknown = sorted(set(df["model_type"]) - allowed_types)
+    if unknown:
+        raise ValueError(f"Unsupported hydro model_type values in {csv_file}: {unknown}")
+
+    duplicates = df[df["asset_id"].duplicated(keep=False)]
+    if not duplicates.empty:
+        raise ValueError(
+            f"Duplicate hydro asset_id values in {csv_file}: "
+            f"{sorted(duplicates['asset_id'].astype(str).unique().tolist())}"
+        )
+
+    return df.reset_index(drop=True)
+
+
+def _requested_hydrology_year(
+    general_settings: Optional[dict],
+    model_year: int,
+) -> Optional[int]:
+    """Resolve an optional hydrology year from general.csv."""
+    if not general_settings:
+        return None
+
+    year_specific_key = f"hydro_inflow_year_{int(model_year)}"
+    raw_value = general_settings.get(
+        year_specific_key,
+        general_settings.get("hydro_inflow_year", None),
+    )
+    return _safe_year(raw_value)
+
+
+def load_hydro_inflows_from_csv(
+    snapshots: pd.DatetimeIndex,
+    csv_path: str = DEFAULT_PATHS["hydro_inflows_csv"],
+    hydrology_year: Optional[int] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[int]]:
+    """Load and map hourly hydro profiles to the model snapshots.
+
+    Expected format is a wide table with metadata columns ``hydrology_year``
+    and ``hour_of_year`` followed by one column per profile. Values can be MW
+    inflows or per-unit availabilities; ``hydro_assets.csv`` identifies how
+    each profile is interpreted.
+    """
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return None, None
+
+    df = _read_csv(csv_file)
+    if df.empty:
+        return pd.DataFrame(index=snapshots), hydrology_year
+
+    _require_columns(df, ["hydrology_year", "hour_of_year"], csv_file)
+    df["hydrology_year"] = pd.to_numeric(df["hydrology_year"], errors="coerce").astype("Int64")
+    df["hour_of_year"] = pd.to_numeric(df["hour_of_year"], errors="coerce").astype("Int64")
+
+    available_years = sorted(df["hydrology_year"].dropna().astype(int).unique().tolist())
+    if not available_years:
+        raise ValueError(f"No valid hydrology_year values in {csv_file}.")
+
+    if hydrology_year is None:
+        model_year = int(snapshots[0].year)
+        selected_year = model_year if model_year in available_years else available_years[-1]
+    else:
+        selected_year = int(hydrology_year)
+        if selected_year not in available_years:
+            raise ValueError(
+                f"Hydrology year {selected_year} is not available in {csv_file}. Available years: {available_years}"
+            )
+
+    selected = df[df["hydrology_year"] == selected_year].sort_values("hour_of_year").reset_index(drop=True)
+    actual_hours = selected["hour_of_year"].dropna().astype(int).tolist()
+    expected_hours = list(range(1, len(selected) + 1))
+    if actual_hours != expected_hours:
+        raise ValueError(
+            f"Hydro profiles for hydrology year {selected_year} must have consecutive hour_of_year values 1..N."
+        )
+
+    profiles = selected.drop(columns=["hydrology_year", "hour_of_year"]).apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+    invalid_columns = profiles.columns[profiles.isna().any()].astype(str).tolist()
+    if invalid_columns:
+        raise ValueError(f"Hydro inflow profiles contain missing/non-numeric values in columns: {invalid_columns}")
+
+    profiles = map_weather_year(profiles, target_year=int(snapshots[0].year))
+    profiles = profiles.reindex(snapshots)
+    if profiles.isna().any().any():
+        raise ValueError("Mapped hydro profiles do not match network snapshots exactly.")
+
+    return profiles.astype(float), selected_year
 
 
 def load_hydrogen_assets_from_csv(
@@ -276,61 +585,41 @@ def load_hydrogen_assets_from_csv(
     """
     Load optional hydrogen assets from CSV.
 
+    The table follows the same commissioning logic as generators_capacity.csv:
+    fixed/existing rows are added as exogenous capacity, while flexible/candidate
+    rows become endogenous expansion options once available_from_year is reached.
+
     Required columns:
     - zone
     - asset_type
 
-    Supported asset_type values:
+    Recommended columns:
+    - asset_id: unique PyPSA component id.
+    - technology: physical technology/carrier label.
+    - installed_capacity_mw: existing/fixed power capacity for Link-based assets.
+      For flexible rows this is the initial/minimum capacity, normally 0.
+    - installed_energy_mwh: existing/fixed energy capacity for Store-based assets.
+      For flexible rows this is the initial/minimum capacity, normally 0.
+    - p_nom_max_mw / max_capacity_mw: optional upper bound for flexible Link assets.
+    - e_nom_max_mwh / max_energy_mwh: optional upper bound for flexible Store assets.
+    - commissioning_type, available_from_year, earliest_commissioning_year,
+      fixed_commissioning_year, enabled.
+
+    Supported asset_type values include:
     - electrolyzer
     - h2_fuel_cell
     - h2_turbine
     - h2_store_tank (aliases: h2_tank, tank)
-    - uhs_injection
-    - uhs_withdrawal
-    - uhs_store
-    - uhs (aliases: h2_uhs, h2_store_uhs)
+    - uhs_injection / dgr_injection
+    - uhs_withdrawal / dgr_withdrawal
+    - uhs_store / dgr_store
+    - uhs / dgr (combined UHS row)
 
-    Optional columns:
-    - installed_capacity_mw (for Link-based assets)
-    - installed_energy_mwh (for Store-based assets)
-    - capital_cost
-    - marginal_cost
-    - efficiency
-    - standing_loss (Store only)
-    - available_from_year
-    - enabled
-
-    Optional UHS-specific columns (fallback to generic values if omitted):
-    - injection_capacity_mw
-    - withdrawal_capacity_mw
-    - injection_efficiency
-    - withdrawal_efficiency
-    - injection_capital_cost
-    - withdrawal_capital_cost
-    - injection_marginal_cost
-    - withdrawal_marginal_cost
-    - injection_available_from_year
-    - withdrawal_available_from_year
-    - store_available_from_year
-
-    Seasonal operation columns (optional, for continuous-window reservoirs):
-    - continuous_operation: 1 = enforce seasonal windows as hard 0/1 p_max_pu masks,
-        0 = no restriction (default; optimizer decides freely when to inject/withdraw).
-    - injection_season_start: day of year (1–365) when the injection window opens.
-    - injection_season_days: number of consecutive days for injection.
-    - withdrawal_season_start: day of year (1–365) when the withdrawal window opens.
-    - withdrawal_season_days: number of consecutive days for withdrawal.
-    Windows may wrap across the year boundary (e.g., start=300, days=150 wraps into January).
-    Useful for depleted-gas-reservoir UHS where continuous seasonal blocks are required
-    to avoid mixing and pressure transients (e.g., ~200 days injection, ~100 days winter withdrawal).
-
-        For explicit UHS asset rows:
-        - uhs_injection: uses installed_capacity_mw, efficiency, capital_cost,
-            marginal_cost, available_from_year.
-        - uhs_withdrawal: uses installed_capacity_mw, efficiency, capital_cost,
-            marginal_cost, available_from_year.
-        - uhs_store: uses installed_energy_mwh, standing_loss, capital_cost,
-            marginal_cost, available_from_year.
+    Seasonal operation columns are optional for UHS:
+    - continuous_operation: 1 = enforce seasonal windows as hard 0/1 p_max_pu masks;
+      0 = no seasonal restriction, optimizer decides freely when to inject/withdraw.
+    - injection_season_start, injection_season_days
+    - withdrawal_season_start, withdrawal_season_days
     """
     csv_file = _resolve_csv_path(csv_path)
     if not csv_file.exists():
@@ -340,7 +629,231 @@ def load_hydrogen_assets_from_csv(
     _require_columns(df, ["zone", "asset_type"], csv_file)
 
     if "enabled" in df.columns:
-        df = df[df["enabled"] == True].copy()  # noqa: E712
+        df = df[df["enabled"].map(lambda v: _as_bool(v, default=True))].copy()
+
+    if "technology" not in df.columns:
+        df["technology"] = df["asset_type"]
+    else:
+        technology_missing = df["technology"].isna() | (df["technology"].astype(str).str.strip() == "")
+        df.loc[technology_missing, "technology"] = df.loc[technology_missing, "asset_type"]
+
+    df["zone"] = df["zone"].astype(str).str.strip()
+    df["asset_type"] = df["asset_type"].astype(str).str.strip().str.lower()
+    df["technology"] = df["technology"].map(_normalize_label)
+
+    return df.reset_index(drop=True)
+
+
+def _ptx_product_key(value, default: str = "") -> str:
+    """Normalize PtX product names to internal keys."""
+    key = _normalize_label(value, default=default)
+    aliases = {
+        "nh3": "ammonia",
+        "ammonia": "ammonia",
+        "amoniaco": "ammonia",
+        "amonio": "ammonia",
+        "meoh": "methanol",
+        "ch3oh": "methanol",
+        "methanol": "methanol",
+        "metanol": "methanol",
+    }
+    return aliases.get(key, key)
+
+
+PTX_PRODUCT_DEFAULTS = {
+    "ammonia": {
+        "carrier": "ammonia",
+        "bus_prefix": "nh3",
+        "synthesis_carrier": "ammonia_synthesis",
+        "storage_carrier": "ammonia_storage",
+        "export_carrier": "ammonia_export",
+        "feedstock": "nitrogen",
+        "feedstock_bus_prefix": "n2",
+        "feedstock_t_per_t_product": 0.824,
+        "h2_mwh_per_t_product": 5.90,
+    },
+    "methanol": {
+        "carrier": "methanol",
+        "bus_prefix": "ch3oh",
+        "synthesis_carrier": "methanol_synthesis",
+        "storage_carrier": "methanol_storage",
+        "export_carrier": "methanol_export",
+        "feedstock": "co2",
+        "feedstock_bus_prefix": "co2",
+        "feedstock_t_per_t_product": 1.375,
+        "h2_mwh_per_t_product": 6.25,
+    },
+}
+
+
+def _ptx_asset_product_from_row(row: pd.Series, asset_type: str) -> str:
+    """Infer ammonia/methanol product from an explicit product column or asset type."""
+    explicit = _ptx_product_key(row.get("product", ""), default="")
+    if explicit:
+        return explicit
+    normalized_type = _normalize_label(asset_type)
+    if "nh3" in normalized_type or "ammonia" in normalized_type:
+        return "ammonia"
+    if "meoh" in normalized_type or "ch3oh" in normalized_type or "methanol" in normalized_type:
+        return "methanol"
+    return ""
+
+
+def _ptx_asset_id(row: pd.Series, asset_type: str, zone: str, product: str = "") -> str:
+    """Return a stable PyPSA component id for PtX assets."""
+    base = _normalize_label(asset_type, default="ptx_asset")
+    product_key = _ptx_product_key(product, default="")
+    if product_key:
+        base = f"{product_key}_{base}"
+    return _asset_id_from_row(row, f"{base}_{zone}")
+
+
+def _ptx_conversion_efficiency_from_row(
+    row: pd.Series,
+    efficiency_col: str,
+    inverse_col: str,
+    default_inverse: Optional[float] = None,
+    default_efficiency: Optional[float] = None,
+) -> float:
+    """Return output/input conversion efficiency, supporting both efficiency and inverse input intensity."""
+    inverse = _safe_float(row.get(inverse_col, np.nan), np.nan)
+    if np.isfinite(inverse) and inverse > 0:
+        return 1.0 / inverse
+
+    efficiency = _safe_float(row.get(efficiency_col, np.nan), np.nan)
+    if np.isfinite(efficiency) and efficiency > 0:
+        return efficiency
+
+    if default_inverse is not None and np.isfinite(default_inverse) and default_inverse > 0:
+        return 1.0 / default_inverse
+
+    if default_efficiency is not None and np.isfinite(default_efficiency) and default_efficiency > 0:
+        return float(default_efficiency)
+
+    raise ValueError(
+        f"PtX asset {_asset_id_from_row(row, 'unknown')} requires either {efficiency_col} or {inverse_col}."
+    )
+
+
+def load_ptx_assets_from_csv(
+    csv_path: str = DEFAULT_PATHS["ptx_assets_csv"],
+) -> Optional[pd.DataFrame]:
+    """
+    Load optional PtX conversion, feedstock, product storage and export assets.
+
+    Required columns:
+    - zone
+    - asset_type
+
+    Supported asset_type values include:
+    - asu / air_separation_unit / n2_production
+    - dac / direct_air_capture / co2_capture
+    - ammonia_synthesis / nh3_synthesis / haber_bosch
+    - methanol_synthesis / ch3oh_synthesis / meoh_synthesis
+    - ammonia_store / nh3_store
+    - methanol_store / ch3oh_store / meoh_store
+
+    Useful optional columns:
+    - product: ammonia or methanol.
+    - installed_capacity_mw / p_nom_max_mw: Link input capacity.
+      For synthesis, this is MW_H2 input. For ASU/DAC, this is MW_e input.
+    - installed_energy_tons / e_nom_max_tons: product storage capacity.
+    - electricity_mwh_per_t: electricity input intensity for ASU/DAC.
+    - h2_mwh_per_t_product: H2 input intensity for synthesis.
+    - feedstock_t_per_t_product: N2 or CO2 requirement per tonne of product.
+    - efficiency: output/input conversion efficiency when no inverse-intensity column is used.
+    - commissioning_type, available_from_year, earliest_commissioning_year,
+      fixed_commissioning_year, enabled.
+    """
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return None
+
+    df = _read_csv(csv_file)
+    if df.empty:
+        return df
+
+    _require_columns(df, ["zone", "asset_type"], csv_file)
+
+    if "enabled" in df.columns:
+        df = df[df["enabled"].map(lambda v: _as_bool(v, default=True))].copy()
+
+    if "technology" not in df.columns:
+        df["technology"] = df["asset_type"]
+    else:
+        technology_missing = df["technology"].isna() | (df["technology"].astype(str).str.strip() == "")
+        df.loc[technology_missing, "technology"] = df.loc[technology_missing, "asset_type"]
+
+    if "product" not in df.columns:
+        df["product"] = ""
+
+    df["zone"] = df["zone"].astype(str).str.strip()
+    df["asset_type"] = df["asset_type"].astype(str).str.strip().str.lower()
+    df["technology"] = df["technology"].map(_normalize_label)
+    df["product"] = df["product"].map(lambda v: _ptx_product_key(v, default=""))
+
+    return df.reset_index(drop=True)
+
+
+def load_ptx_monthly_demand_from_csv(
+    csv_path: str = DEFAULT_PATHS["ptx_monthly_demand_csv"],
+) -> Optional[pd.DataFrame]:
+    """
+    Load monthly export requirements for PtX products.
+
+    Expected columns:
+    - zone
+    - product: ammonia/nh3 or methanol/ch3oh/meoh
+    - month: 1..12
+    - demand_tons: monthly export requirement in tonnes of product
+
+    Optional columns:
+    - year: if present, rows are filtered to the model year during network build.
+    - scenario
+    - export_flexibility_factor: 1.0 means export can occur up to the monthly
+      average rate; values >1 allow more intra-month export flexibility.
+    - enabled
+    """
+    csv_file = _resolve_csv_path(csv_path)
+    if not csv_file.exists():
+        return None
+
+    df = _read_csv(csv_file)
+    if df.empty:
+        return df
+
+    _require_columns(df, ["zone", "product", "month", "demand_tons"], csv_file)
+
+    if "enabled" in df.columns:
+        df = df[df["enabled"].map(lambda v: _as_bool(v, default=True))].copy()
+
+    df["zone"] = df["zone"].astype(str).str.strip()
+    df["product"] = df["product"].map(lambda v: _ptx_product_key(v, default=""))
+    df["month"] = pd.to_numeric(df["month"], errors="coerce").astype("Int64")
+    df["demand_tons"] = pd.to_numeric(df["demand_tons"], errors="coerce").fillna(0.0).astype(float)
+    if "year" in df.columns:
+        df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+    if "export_flexibility_factor" not in df.columns:
+        raise ValueError(
+            f"Missing required column in {csv_file}: ['export_flexibility_factor']. "
+            "Set it explicitly instead of relying on an internal default."
+        )
+    flex = pd.to_numeric(df["export_flexibility_factor"], errors="coerce")
+    invalid_flex = flex.isna() | (flex < 1.0)
+    if invalid_flex.any():
+        bad_values = df.loc[invalid_flex, "export_flexibility_factor"].astype(str).unique().tolist()
+        raise ValueError(
+            f"Invalid export_flexibility_factor values in {csv_file}: {bad_values}. Use finite values >= 1.0."
+        )
+    df["export_flexibility_factor"] = flex.astype(float)
+
+    invalid_months = df[~df["month"].between(1, 12)]
+    if not invalid_months.empty:
+        raise ValueError(f"Invalid month values in {csv_file}: {invalid_months['month'].dropna().unique().tolist()}")
+
+    unknown_products = sorted(set(df["product"].astype(str)) - set(PTX_PRODUCT_DEFAULTS.keys()))
+    if unknown_products:
+        raise ValueError(f"Unsupported PtX product(s) in {csv_file}: {unknown_products}")
 
     return df.reset_index(drop=True)
 
@@ -390,6 +903,34 @@ def _normalize_annual_rate(rate) -> Optional[float]:
     if abs(parsed) > 1.0:
         return parsed / 100.0
     return parsed
+
+
+def _normalize_label(value, default: str = "") -> str:
+    """Normalize CSV labels used as technology/carrier/status names."""
+    if value is None or pd.isna(value):
+        return default
+    text = str(value).strip().lower()
+    if text in {"", "nan", "none", "null"}:
+        return default
+    for old in [" ", "-", "/"]:
+        text = text.replace(old, "_")
+    while "__" in text:
+        text = text.replace("__", "_")
+    return text.strip("_") or default
+
+
+def _as_bool(value, default: bool = True, *, context: str = "boolean value") -> bool:
+    """Parse optional CSV boolean-like values, failing on invalid text."""
+    if value is None or pd.isna(value):
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "false", "f", "no", "n"}:
+        return False
+    raise ValueError(f"Invalid {context}: {value!r}. Use TRUE/FALSE or 1/0.")
 
 
 def _select_cost_rows_for_year(costs_df: pd.DataFrame, year: int) -> pd.DataFrame:
@@ -549,18 +1090,29 @@ def load_general_settings_from_csv(
 def _resolve_slack_cost(
     slack_cost_per_mwh: Optional[float],
     general_settings: Optional[dict] = None,
-    default: float = 500.0,
 ) -> float:
-    """Resolve slack penalty priority: arg > general.csv > default."""
+    """Resolve slack penalty priority: explicit argument > general.csv.
+
+    No internal default is allowed, because a hidden slack penalty can change
+    feasibility, dispatch and cost interpretation.
+    """
     if slack_cost_per_mwh is not None and not pd.isna(slack_cost_per_mwh):
-        return float(slack_cost_per_mwh)
+        value = float(slack_cost_per_mwh)
+    elif general_settings and "slack_cost_per_mwh" in general_settings:
+        raw_value = general_settings.get("slack_cost_per_mwh")
+        if raw_value is None or pd.isna(raw_value):
+            raise ValueError("slack_cost_per_mwh is present in general.csv but empty.")
+        value = float(raw_value)
+    else:
+        raise ValueError(
+            "Missing required parameter: slack_cost_per_mwh. "
+            "Add it to general.csv or pass slack_cost_per_mwh explicitly."
+        )
 
-    if general_settings and "slack_cost_per_mwh" in general_settings:
-        value = general_settings.get("slack_cost_per_mwh")
-        if value is not None and not pd.isna(value):
-            return float(value)
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"slack_cost_per_mwh must be positive and finite. Got {value}.")
 
-    return float(default)
+    return value
 
 
 def _apply_cost_defaults(
@@ -576,11 +1128,15 @@ def _apply_cost_defaults(
     storage_output = storage_df.copy() if storage_df is not None else None
 
     if capacity_output is not None:
+        generator_labels = capacity_output["generator"].map(_normalize_label)
+        if "technology" in capacity_output.columns:
+            technology_labels = capacity_output["technology"].map(_normalize_label)
+        else:
+            technology_labels = generator_labels
+
         for _, row in costs_df.iterrows():
-            technology = str(row["technology"])
-            mask = capacity_output["generator"].astype(str) == technology
-            if "technology" in capacity_output.columns:
-                mask = mask | (capacity_output["technology"].astype(str) == technology)
+            technology = _normalize_label(row["technology"])
+            mask = (generator_labels == technology) | (technology_labels == technology)
 
             for col in ["capital_cost", "marginal_cost", "efficiency"]:
                 if col in row.index:
@@ -621,12 +1177,76 @@ def _get_technology_attribute(
     if costs_df is None or costs_df.empty or column not in costs_df.columns:
         return default
 
-    matches = costs_df[costs_df["technology"].astype(str) == str(technology)]
+    target = _normalize_label(technology)
+    matches = costs_df[costs_df["technology"].map(_normalize_label) == target]
     if matches.empty:
         return default
 
     value = matches.iloc[0][column]
     return default if pd.isna(value) else float(value)
+
+
+def _require_finite_float(value, context: str) -> float:
+    """Return a finite numeric value or raise an explicit input error."""
+    if value is None or pd.isna(value):
+        raise ValueError(f"Missing required numeric value: {context}.")
+    try:
+        out = float(value)
+    except Exception as exc:
+        raise ValueError(f"Invalid numeric value for {context}: {value!r}.") from exc
+    if not np.isfinite(out):
+        raise ValueError(f"Non-finite numeric value for {context}: {out}.")
+    return out
+
+
+def _require_row_float(row: pd.Series, column: str, context: str) -> float:
+    """Read a required numeric column from a CSV row."""
+    if column not in row.index:
+        raise ValueError(f"Missing required column '{column}' for {context}.")
+    return _require_finite_float(row.get(column), f"{context}.{column}")
+
+
+def _require_row_or_technology_attribute(
+    row: pd.Series,
+    row_column: str,
+    costs_df: Optional[pd.DataFrame],
+    technology: str,
+    cost_column: Optional[str] = None,
+    context: str = "component",
+) -> float:
+    """Read a value from the component row, otherwise require it from costs.csv."""
+    if row_column in row.index and not pd.isna(row.get(row_column)):
+        return _require_finite_float(row.get(row_column), f"{context}.{row_column}")
+    return _require_technology_attribute(costs_df, technology, cost_column or row_column)
+
+
+def _require_technology_attribute(
+    costs_df: Optional[pd.DataFrame],
+    technology: str,
+    column: str,
+) -> float:
+    """Read a required technology attribute from costs.csv.
+
+    This strict helper deliberately raises when the value is missing, instead
+    of using internal modelling defaults.
+    """
+    if costs_df is None or costs_df.empty:
+        raise ValueError(f"costs.csv is required because technology='{technology}', column='{column}' is needed.")
+
+    if "technology" not in costs_df.columns:
+        raise ValueError("costs.csv must include a 'technology' column.")
+
+    if column not in costs_df.columns:
+        raise ValueError(f"costs.csv is missing required column '{column}'.")
+
+    target = _normalize_label(technology)
+    matches = costs_df[costs_df["technology"].map(_normalize_label) == target]
+
+    if matches.empty:
+        raise ValueError(f"costs.csv is missing required technology row: '{technology}' for column '{column}'.")
+
+    value = matches.iloc[0][column]
+    return _require_finite_float(value, f"costs.csv[{technology}].{column}")
 
 
 def _co2_cap_for_year(co2_cap_tons, year: int):
@@ -643,9 +1263,12 @@ def validate_inputs(
     csv_capacity: str = DEFAULT_PATHS["capacity_csv"],
     csv_storage: str = DEFAULT_PATHS["storage_csv"],
     csv_hydrogen: str = DEFAULT_PATHS["hydrogen_csv"],
+    csv_ptx_assets: str = DEFAULT_PATHS["ptx_assets_csv"],
+    csv_ptx_monthly_demand: str = DEFAULT_PATHS["ptx_monthly_demand_csv"],
     csv_interlinks: str = DEFAULT_PATHS["interlinks_csv"],
     csv_costs: str = DEFAULT_PATHS["costs_csv"],
     enable_hydrogen: bool = True,
+    enable_ptx: bool = True,
     strict: bool = True,
 ) -> dict:
     """
@@ -661,12 +1284,18 @@ def validate_inputs(
         Path to storage capacity CSV
     csv_hydrogen : str
         Path to optional hydrogen assets CSV
+    csv_ptx_assets : str
+        Path to optional PtX assets CSV
+    csv_ptx_monthly_demand : str
+        Path to optional PtX monthly export demand CSV
     csv_interlinks : str
         Path to interlinks CSV
     csv_costs : str
         Path to costs CSV
     enable_hydrogen : bool
         If False, skip validation of optional hydrogen assets inputs.
+    enable_ptx : bool
+        If False, skip validation of optional PtX inputs.
     strict : bool
         If True, raise errors on validation failures. If False, return warnings only.
 
@@ -685,29 +1314,26 @@ def validate_inputs(
     else:
         if nodes_df.empty:
             errors.append("Nodes CSV has no enabled nodes")
-        
+
         if {"lat", "lon"}.issubset(nodes_df.columns):
             missing_coords = nodes_df[["lat", "lon"]].isna().any(axis=1)
             if missing_coords.any():
                 warnings.append(
-                    f"Some nodes have missing lat/lon coordinates: "
-                    f"{nodes_df.loc[missing_coords, 'zone'].tolist()}"
+                    f"Some nodes have missing lat/lon coordinates: {nodes_df.loc[missing_coords, 'zone'].tolist()}"
                 )
         else:
             warnings.append("Nodes CSV missing lat/lon columns - VRE profiles cannot be generated from cutout")
 
         zones = set(nodes_df["zone"].astype(str))
-    
+
         # Check capacity CSV
         capacity_df = load_generator_capacity_from_csv(csv_capacity)
         if capacity_df is not None:
             capacity_zones = set(capacity_df["zone"].astype(str))
             extra_zones = capacity_zones - zones
             if extra_zones:
-                warnings.append(
-                    f"Generators CSV references zones not in nodes CSV: {sorted(extra_zones)}"
-                )
-            
+                warnings.append(f"Generators CSV references zones not in nodes CSV: {sorted(extra_zones)}")
+
             missing_cols = []
             for col in ["capital_cost", "marginal_cost", "efficiency"]:
                 if col not in capacity_df.columns:
@@ -715,7 +1341,7 @@ def validate_inputs(
             if missing_cols:
                 warnings.append(
                     f"Generators CSV missing recommended columns: {missing_cols} "
-                    "(will use defaults or costs CSV)"
+                    "(must be provided directly or through costs.csv)"
                 )
         else:
             warnings.append(f"Generators capacity CSV not found: {csv_capacity}")
@@ -726,9 +1352,7 @@ def validate_inputs(
             storage_zones = set(storage_df["zone"].astype(str))
             extra_zones = storage_zones - zones
             if extra_zones:
-                warnings.append(
-                    f"Storage CSV references zones not in nodes CSV: {sorted(extra_zones)}"
-                )
+                warnings.append(f"Storage CSV references zones not in nodes CSV: {sorted(extra_zones)}")
         else:
             warnings.append(f"Storage capacity CSV not found: {csv_storage}")
 
@@ -748,9 +1372,7 @@ def validate_inputs(
                 hydrogen_zones = set(hydrogen_df["zone"].astype(str))
                 extra_zones = hydrogen_zones - zones
                 if extra_zones:
-                    warnings.append(
-                        f"Hydrogen CSV references zones not in nodes CSV: {sorted(extra_zones)}"
-                    )
+                    warnings.append(f"Hydrogen CSV references zones not in nodes CSV: {sorted(extra_zones)}")
 
                 supported_assets = {
                     "electrolyzer",
@@ -765,19 +1387,63 @@ def validate_inputs(
                     "uhs",
                     "h2_uhs",
                     "h2_store_uhs",
+                    "dgr_injection",
+                    "dgr_withdrawal",
+                    "dgr_store",
+                    "dgr",
                 }
-                unknown_assets = set(hydrogen_df["asset_type"].astype(str)) - supported_assets
+                unknown_assets = set(hydrogen_df["asset_type"].astype(str).str.strip().str.lower()) - supported_assets
                 if unknown_assets:
-                    warnings.append(
-                        f"Hydrogen CSV includes unsupported asset_type values: {sorted(unknown_assets)}"
-                    )
+                    warnings.append(f"Hydrogen CSV includes unsupported asset_type values: {sorted(unknown_assets)}")
             else:
                 warnings.append(f"Hydrogen assets CSV not found: {csv_hydrogen} (optional)")
+
+        # Check optional PtX assets and monthly demands
+        if enable_ptx:
+            ptx_assets_df = load_ptx_assets_from_csv(csv_ptx_assets)
+            if ptx_assets_df is not None:
+                ptx_zones = set(ptx_assets_df["zone"].astype(str))
+                extra_zones = ptx_zones - zones
+                if extra_zones:
+                    warnings.append(f"PtX assets CSV references zones not in nodes CSV: {sorted(extra_zones)}")
+
+                supported_ptx_assets = {
+                    "asu",
+                    "air_separation",
+                    "air_separation_unit",
+                    "n2_production",
+                    "dac",
+                    "direct_air_capture",
+                    "co2_capture",
+                    "ammonia_synthesis",
+                    "nh3_synthesis",
+                    "haber_bosch",
+                    "methanol_synthesis",
+                    "ch3oh_synthesis",
+                    "meoh_synthesis",
+                    "ammonia_store",
+                    "nh3_store",
+                    "methanol_store",
+                    "ch3oh_store",
+                    "meoh_store",
+                }
+                unknown_assets = (
+                    set(ptx_assets_df["asset_type"].astype(str).str.strip().str.lower()) - supported_ptx_assets
+                )
+                if unknown_assets:
+                    warnings.append(f"PtX assets CSV includes unsupported asset_type values: {sorted(unknown_assets)}")
+
+            ptx_monthly_demand_df = load_ptx_monthly_demand_from_csv(csv_ptx_monthly_demand)
+            if ptx_monthly_demand_df is not None:
+                ptx_demand_zones = set(ptx_monthly_demand_df["zone"].astype(str))
+                extra_zones = ptx_demand_zones - zones
+                if extra_zones:
+                    warnings.append(f"PtX monthly demand CSV references zones not in nodes CSV: {sorted(extra_zones)}")
 
         # Check costs CSV
         costs_df = load_technology_costs_from_csv(csv_costs)
         if costs_df is None:
-            warnings.append(f"Costs CSV not found: {csv_costs} (optional, but recommended)")
+            warnings.append(f"Costs CSV not found: {csv_costs} (required for strict config)")
 
     # Report
     valid = len(errors) == 0
@@ -791,22 +1457,22 @@ def validate_inputs(
     print("\n" + "=" * 60)
     print("INPUT VALIDATION REPORT")
     print("=" * 60)
-    
+
     if errors:
         print(f"\n❌ ERRORS ({len(errors)}):")
         for err in errors:
             print(f"  - {err}")
-    
+
     if warnings:
         print(f"\n⚠️  WARNINGS ({len(warnings)}):")
         for warn in warnings:
             print(f"  - {warn}")
-    
+
     if not errors and not warnings:
         print("\n✓ All inputs valid")
     elif not errors:
         print("\n✓ No critical errors (warnings only)")
-    
+
     print("=" * 60 + "\n")
 
     if strict and errors:
@@ -859,8 +1525,9 @@ def _derive_cutout_bounds(
             lat_max = float(coords["lat"].max()) + padding_deg
             return lon_min, lon_max, lat_min, lat_max
 
-    # Legacy fallback bounds (Magallanes).
-    return -76.0, -66.0, -56.0, -50.0
+    raise ValueError(
+        "Cannot derive cutout bounds: nodes_df must contain valid lat/lon or cutout_bounds must be passed explicitly."
+    )
 
 
 def get_case_cutout(
@@ -908,6 +1575,7 @@ def get_case_cutout(
 
     return cutout
 
+
 def _get_vre_profiles_simple(
     cutout,
     nodes_df: pd.DataFrame,
@@ -944,16 +1612,16 @@ def _get_vre_profiles_simple(
             wnd_cf_ts[wnd_ts >= 25] = 0.0
 
             wind_cf[zone] = wnd_cf_ts
-        except Exception:
-            wind_cf[zone] = default_wind_cf
+        except Exception as exc:
+            raise RuntimeError(f"Failed to build simple wind profile for zone '{zone}'.") from exc
 
         try:
             direct_ts = ds["influx_direct"].sel(y=lat, x=lon, method="nearest").values
             diffuse_ts = ds["influx_diffuse"].sel(y=lat, x=lon, method="nearest").values
             solar_cf_ts = ((direct_ts + diffuse_ts) / 1000.0).clip(0, 1)
             solar_cf[zone] = solar_cf_ts
-        except Exception:
-            solar_cf[zone] = default_solar_cf
+        except Exception as exc:
+            raise RuntimeError(f"Failed to build simple solar profile for zone '{zone}'.") from exc
 
     ds.close()
 
@@ -1024,8 +1692,8 @@ def _get_vre_profiles_atlite_technology(
                 per_unit=True,
             )
             wind_cf[zone] = _series_from_atlite_output(wind_output, len(time_index))
-        except Exception:
-            wind_cf[zone] = default_wind_cf
+        except Exception as exc:
+            raise RuntimeError(f"Failed to build atlite wind profile for zone '{zone}'.") from exc
 
         try:
             solar_output = cutout.pv(
@@ -1035,8 +1703,8 @@ def _get_vre_profiles_atlite_technology(
                 per_unit=True,
             )
             solar_cf[zone] = _series_from_atlite_output(solar_output, len(time_index))
-        except Exception:
-            solar_cf[zone] = default_solar_cf
+        except Exception as exc:
+            raise RuntimeError(f"Failed to build atlite solar profile for zone '{zone}'.") from exc
 
     return wind_cf.clip(0, 1), solar_cf.clip(0, 1)
 
@@ -1064,21 +1732,13 @@ def get_vre_profiles_from_cutout(
         return _get_vre_profiles_simple(cutout, nodes_df, default_wind_cf, default_solar_cf)
 
     if method_normalized == "atlite_technology":
-        try:
-            return _get_vre_profiles_atlite_technology(
-                cutout=cutout,
-                nodes_df=nodes_df,
-                default_wind_cf=default_wind_cf,
-                default_solar_cf=default_solar_cf,
-                wind_turbine=wind_turbine,
-                solar_panel=solar_panel,
-                solar_orientation=solar_orientation,
-            )
-        except Exception as exc:
-            print(
-                f"Warning: atlite_technology VRE profiles failed ({exc}). Falling back to simple method."
-            )
-            return _get_vre_profiles_simple(cutout, nodes_df, default_wind_cf, default_solar_cf)
+        return _get_vre_profiles_atlite_technology(
+            cutout=cutout,
+            nodes_df=nodes_df,
+            wind_turbine=wind_turbine,
+            solar_panel=solar_panel,
+            solar_orientation=solar_orientation,
+        )
 
     raise ValueError(f"Unknown VRE profile method: {method}. Use 'simple' or 'atlite_technology'.")
 
@@ -1119,11 +1779,178 @@ def _safe_float(value, default: float) -> float:
     return default if pd.isna(value) else float(value)
 
 
+def _fraction_from_row(
+    row: pd.Series,
+    column: str,
+    default: float = 0.0,
+    *,
+    context: str = "component",
+) -> float:
+    """Read and validate a fractional CSV input in the closed interval [0, 1]."""
+    value = _safe_float(row.get(column, default), default)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{context}.{column} must be between 0 and 1. Got {value}.")
+    return float(value)
+
+
 def _safe_year(value) -> Optional[int]:
     year = _safe_float(value, np.nan)
     if not np.isfinite(year) or year <= 0:
         return None
     return int(year)
+
+
+def _generator_asset_name(row: pd.Series) -> str:
+    """Return a safe asset name from the generator column."""
+    name = _normalize_label(row.get("generator", "generator"), default="generator")
+    return name or "generator"
+
+
+def _generator_technology(row: pd.Series) -> str:
+    """Return the physical technology/carrier for a generator row."""
+    fallback = _generator_asset_name(row)
+    return _normalize_label(row.get("technology", fallback), default=fallback)
+
+
+def _generator_asset_id(row: pd.Series, zone: str) -> str:
+    """Return a unique PyPSA generator id."""
+    explicit_id = _normalize_label(row.get("asset_id", ""), default="")
+    if explicit_id:
+        return explicit_id
+    return f"{_generator_asset_name(row)}_{zone}"
+
+
+def _technology_profile_key(technology: str) -> Optional[str]:
+    """Map technology labels to available VRE profile libraries."""
+    tech = _normalize_label(technology)
+    wind_aliases = {
+        "wind",
+        "onwind",
+        "onshore_wind",
+        "wind_onshore",
+        "offwind",
+        "offshore_wind",
+        "wind_offshore",
+    }
+    solar_aliases = {
+        "solar",
+        "pv",
+        "solar_pv",
+        "photovoltaic",
+        "utility_pv",
+        "rooftop_pv",
+    }
+    if tech in wind_aliases or tech.startswith("wind_"):
+        return "wind"
+    if tech in solar_aliases or tech.startswith("solar_"):
+        return "solar"
+    return None
+
+
+def _is_hydro_technology(technology: str) -> bool:
+    tech = _normalize_label(technology)
+    return tech == "hydro" or tech.startswith("hydro_")
+
+
+def _resolve_generator_commissioning(row: pd.Series, model_year: int) -> Tuple[bool, bool, str, Optional[int]]:
+    """Resolve generator availability and expandability for a model year.
+
+    Returns
+    -------
+    is_available : bool
+        Whether the row should be added to the network in this model year.
+    expansion_allowed : bool
+        Whether PyPSA may optimize p_nom between p_nom_min and p_nom_max.
+    status : str
+        One of fixed, flexible, retired.
+    relevant_year : int or None
+        Commissioning/availability year used for the decision.
+
+    Backward-compatible defaults:
+    - fixed_commissioning_year or commissioning_type=fixed/existing/committed -> fixed capacity.
+    - available_from_year / earliest_commissioning_year or commissioning_type=flexible/candidate -> flexible candidate.
+    - no commissioning metadata -> fixed existing capacity.
+    """
+    raw_type = _normalize_label(row.get("commissioning_type", ""), default="")
+    available_year = _safe_year(row.get("available_from_year", np.nan))
+    earliest_year = _safe_year(row.get("earliest_commissioning_year", np.nan))
+    fixed_year = _safe_year(row.get("fixed_commissioning_year", np.nan))
+
+    candidate_year = earliest_year if earliest_year is not None else available_year
+
+    fixed_aliases = {"fixed", "existing", "committed", "commissioned", "exogenous"}
+    flexible_aliases = {"flexible", "candidate", "extendable", "expandable", "endogenous"}
+    retired_aliases = {"retired", "disabled", "excluded", "inactive"}
+
+    if raw_type in retired_aliases:
+        return False, False, "retired", None
+
+    if raw_type in fixed_aliases or fixed_year is not None:
+        year_available = fixed_year if fixed_year is not None else candidate_year
+        if year_available is None:
+            year_available = model_year
+        return model_year >= year_available, False, "fixed", year_available
+
+    if raw_type in flexible_aliases or candidate_year is not None:
+        year_available = candidate_year if candidate_year is not None else model_year
+        return model_year >= year_available, model_year >= year_available, "flexible", year_available
+
+    decommissioning_year = _safe_year(row.get("decommissioning_year", np.nan))
+
+    if decommissioning_year is not None and model_year >= decommissioning_year:
+        return False, False, "retired", decommissioning_year
+
+    # Legacy fallback: a row with no commissioning metadata is treated as existing/fixed.
+    return True, False, "fixed", model_year
+
+
+def _asset_id_from_row(row: pd.Series, default: str) -> str:
+    """Return a unique component id, preferring explicit asset_id when provided."""
+    explicit_id = _normalize_label(row.get("asset_id", ""), default="")
+    if explicit_id:
+        return explicit_id
+    return _normalize_label(default, default=default)
+
+
+def _optional_upper_bound(row: pd.Series, columns: list[str]) -> float:
+    """Read optional upper bound from the first finite candidate column."""
+    for col in columns:
+        if col in row.index:
+            value = _safe_float(row.get(col, np.nan), np.nan)
+            if np.isfinite(value):
+                return float(value)
+    return np.nan
+
+
+def _upper_bound_or_nan(linked_min: float, explicit_upper: float) -> float:
+    """Return an expansion upper bound compatible with year-linking."""
+    if np.isfinite(explicit_upper):
+        return float(max(float(linked_min), float(explicit_upper)))
+    return np.nan
+
+
+def _storage_asset_id(row: pd.Series, zone: str, max_hours: float, technology: str = "bess") -> str:
+    """Return storage asset id with support for multiple BESS durations per zone."""
+    if "storage" in row.index and pd.notna(row.get("storage")) and str(row.get("storage")).strip():
+        base = _normalize_label(row.get("storage"), default=technology)
+    else:
+        hours_label = f"{float(max_hours):g}h".replace(".", "_")
+        base = f"{technology}_{hours_label}"
+    return _asset_id_from_row(row, f"{base}_{zone}")
+
+
+def _h2_asset_id(row: pd.Series, asset_type: str, zone: str) -> str:
+    """Return hydrogen asset id from CSV or a stable default."""
+    defaults = {
+        "electrolyzer": f"h2_electrolyzer_{zone}",
+        "h2_fuel_cell": f"h2_fuel_cell_{zone}",
+        "h2_turbine": f"h2_turbine_{zone}",
+        "h2_store_tank": f"h2_store_{zone}",
+        "uhs_injection": f"uhs_injection_{zone}",
+        "uhs_withdrawal": f"uhs_withdrawal_{zone}",
+        "uhs_store": f"uhs_store_{zone}",
+    }
+    return _asset_id_from_row(row, defaults.get(asset_type, f"{asset_type}_{zone}"))
 
 
 def _previous_nominal_capacity(previous_year_network, component: str, asset_id: str, default: float) -> float:
@@ -1150,6 +1977,148 @@ def _previous_store_energy_capacity(previous_year_network, asset_id: str, defaul
     return float(table.loc[asset_id, "e_nom"])
 
 
+def _add_csv_driven_hydro_asset(
+    n,
+    snapshots: pd.DatetimeIndex,
+    generator_row: pd.Series,
+    hydro_row: pd.Series,
+    hydro_inflows: pd.DataFrame,
+    gen_id: str,
+    zone: str,
+    technology: str,
+    p_nom: float,
+    p_nom_min: float,
+    p_nom_max: float,
+    expansion_allowed: bool,
+    capital_cost: float,
+    marginal_cost: float,
+    efficiency: float,
+    commissioning_status: str,
+    commissioning_year: Optional[int],
+) -> None:
+    """Add one hydro asset using an explicit hourly inflow representation."""
+    if hydro_inflows is None or hydro_inflows.empty:
+        raise ValueError(
+            f"Hydro asset {gen_id} is configured in hydro_assets.csv, but hydro_inflows.csv was not loaded."
+        )
+
+    profile_id = str(hydro_row.get("profile_id", "")).strip()
+    if profile_id not in hydro_inflows.columns:
+        raise ValueError(
+            f"Hydro asset {gen_id} requires profile_id='{profile_id}', but that "
+            "column is missing from hydro_inflows.csv."
+        )
+
+    model_type = _normalize_label(hydro_row.get("model_type", ""))
+    profile = pd.Series(hydro_inflows[profile_id], index=snapshots, dtype=float)
+    if not np.isfinite(profile.to_numpy()).all() or (profile < 0).any():
+        raise ValueError(f"Hydro profile '{profile_id}' must be finite and non-negative.")
+
+    if model_type == "reservoir":
+        if expansion_allowed:
+            raise ValueError(
+                f"Hydro reservoir {gen_id} is extendable. The first hydro "
+                "implementation supports fixed reservoir turbine capacity only."
+            )
+        if p_nom <= 0:
+            raise ValueError(f"Hydro reservoir {gen_id} requires positive turbine capacity.")
+
+        energy_capacity_mwh = _require_row_float(
+            hydro_row,
+            "energy_capacity_mwh",
+            f"Hydro reservoir {gen_id}",
+        )
+        initial_soc_pu = _require_row_float(
+            hydro_row,
+            "initial_soc_pu",
+            f"Hydro reservoir {gen_id}",
+        )
+        min_soc_pu = _safe_float(hydro_row.get("min_soc_pu", 0.0), 0.0)
+        max_soc_pu = _safe_float(hydro_row.get("max_soc_pu", 1.0), 1.0)
+        final_soc_pu = _safe_float(hydro_row.get("final_soc_pu", initial_soc_pu), initial_soc_pu)
+        standing_loss = _safe_float(hydro_row.get("standing_loss", 0.0), 0.0)
+        turbine_efficiency = _safe_float(hydro_row.get("turbine_efficiency", 1.0), 1.0)
+
+        if energy_capacity_mwh <= 0:
+            raise ValueError(f"Hydro reservoir {gen_id} requires energy_capacity_mwh > 0.")
+        for label, value in {
+            "initial_soc_pu": initial_soc_pu,
+            "min_soc_pu": min_soc_pu,
+            "max_soc_pu": max_soc_pu,
+            "final_soc_pu": final_soc_pu,
+        }.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"Hydro reservoir {gen_id} has invalid {label}={value}.")
+        if min_soc_pu > max_soc_pu:
+            raise ValueError(f"Hydro reservoir {gen_id} has min_soc_pu > max_soc_pu.")
+        if not min_soc_pu <= initial_soc_pu <= max_soc_pu:
+            raise ValueError(f"Hydro reservoir {gen_id} initial SOC lies outside its bounds.")
+        if not min_soc_pu <= final_soc_pu <= max_soc_pu:
+            raise ValueError(f"Hydro reservoir {gen_id} final SOC lies outside its bounds.")
+
+        max_hours = energy_capacity_mwh / float(p_nom)
+        n.add(
+            "StorageUnit",
+            gen_id,
+            bus=f"elec_{zone}",
+            carrier=technology,
+            p_nom=float(p_nom),
+            p_nom_min=float(p_nom),
+            p_nom_max=float(p_nom),
+            p_nom_extendable=False,
+            p_min_pu=0.0,
+            max_hours=float(max_hours),
+            state_of_charge_initial=float(initial_soc_pu * energy_capacity_mwh),
+            cyclic_state_of_charge=False,
+            inflow=profile.values,
+            efficiency_store=1.0,
+            efficiency_dispatch=float(turbine_efficiency),
+            standing_loss=float(standing_loss),
+            capital_cost=float(capital_cost),
+            marginal_cost=float(marginal_cost),
+        )
+        n.storage_units.loc[gen_id, "source_asset_type"] = "hydro_reservoir"
+        n.storage_units.loc[gen_id, "source_asset_id"] = gen_id
+        n.storage_units.loc[gen_id, "hydro_min_soc_pu"] = float(min_soc_pu)
+        n.storage_units.loc[gen_id, "hydro_max_soc_pu"] = float(max_soc_pu)
+        n.storage_units.loc[gen_id, "hydro_final_soc_pu"] = float(final_soc_pu)
+        n.storage_units.loc[gen_id, "hydro_energy_capacity_mwh"] = float(energy_capacity_mwh)
+        n.storage_units.loc[gen_id, "commissioning_type"] = commissioning_status
+        n.storage_units.loc[gen_id, "commissioning_year"] = (
+            float(commissioning_year) if commissioning_year is not None else np.nan
+        )
+        return
+
+    attrs = {
+        "bus": f"elec_{zone}",
+        "carrier": technology,
+        "p_nom": float(p_nom),
+        "p_nom_min": float(p_nom_min),
+        "p_nom_extendable": bool(expansion_allowed),
+        "p_nom_max": float(p_nom_max),
+        "capital_cost": float(capital_cost),
+        "marginal_cost": float(marginal_cost),
+        "efficiency": float(efficiency),
+    }
+
+    if model_type == "inflow_generator":
+        attrs["p_max_pu"] = (
+            np.clip(profile.to_numpy() / float(p_nom), 0.0, 1.0) if p_nom > 0 else np.zeros(len(snapshots), dtype=float)
+        )
+    elif model_type == "availability_generator":
+        attrs["p_max_pu"] = np.clip(profile.to_numpy(), 0.0, 1.0)
+    else:
+        raise ValueError(f"Unsupported hydro model_type '{model_type}' for {gen_id}.")
+
+    n.add("Generator", gen_id, **attrs)
+    n.generators.loc[gen_id, "source_asset_type"] = model_type
+    n.generators.loc[gen_id, "source_asset_id"] = gen_id
+    n.generators.loc[gen_id, "commissioning_type"] = commissioning_status
+    n.generators.loc[gen_id, "commissioning_year"] = (
+        float(commissioning_year) if commissioning_year is not None else np.nan
+    )
+
+
 def build_case_network(
     snapshots: pd.DatetimeIndex,
     nodes_df: pd.DataFrame,
@@ -1158,8 +2127,13 @@ def build_case_network(
     interlinks: Optional[list] = None,
     capacity_df: Optional[pd.DataFrame] = None,
     storage_df: Optional[pd.DataFrame] = None,
+    hydro_assets_df: Optional[pd.DataFrame] = None,
+    hydro_inflows: Optional[pd.DataFrame] = None,
+    hydrology_year: Optional[int] = None,
     hydrogen_df: Optional[pd.DataFrame] = None,
     hydrogen_demand: Optional[pd.DataFrame] = None,
+    ptx_assets_df: Optional[pd.DataFrame] = None,
+    ptx_monthly_demand_df: Optional[pd.DataFrame] = None,
     vre_profiles: Optional[Dict[str, pd.DataFrame]] = None,
     year: Optional[int] = None,
     previous_year_network=None,
@@ -1167,20 +2141,31 @@ def build_case_network(
     costs_overrides: Optional[dict] = None,
     general_settings: Optional[dict] = None,
     enable_hydrogen: bool = True,
+    enable_ptx: bool = True,
     slack_cost_per_mwh: Optional[float] = None,
     csv_interlinks: str = DEFAULT_PATHS["interlinks_csv"],
     csv_capacity: str = DEFAULT_PATHS["capacity_csv"],
     csv_storage: str = DEFAULT_PATHS["storage_csv"],
+    csv_hydro_assets: str = DEFAULT_PATHS["hydro_assets_csv"],
+    csv_hydro_inflows: str = DEFAULT_PATHS["hydro_inflows_csv"],
     csv_hydrogen: str = DEFAULT_PATHS["hydrogen_csv"],
+    csv_ptx_assets: str = DEFAULT_PATHS["ptx_assets_csv"],
+    csv_ptx_monthly_demand: str = DEFAULT_PATHS["ptx_monthly_demand_csv"],
     csv_costs: str = DEFAULT_PATHS["costs_csv"],
 ):
     """Build a multi-node PyPSA electricity network from CSV-driven inputs."""
     n = pypsa.Network()
     n.set_snapshots(snapshots)
+    n._hydrology_year = hydrology_year
     model_year = int(year) if year is not None else int(snapshots[0].year)
-    slack_cost_per_mwh = _resolve_slack_cost(slack_cost_per_mwh, general_settings=None, default=500.0)
-    hydro_capacity_factor = _safe_float((general_settings or {}).get("hydro_capacity_factor", np.nan), 0.45)
-    hydro_capacity_factor = float(np.clip(hydro_capacity_factor, 0.0, 1.0))
+    slack_cost_per_mwh = _resolve_slack_cost(slack_cost_per_mwh, general_settings=general_settings)
+    hydro_capacity_factor = None
+    if general_settings and "hydro_capacity_factor" in general_settings:
+        hydro_capacity_factor = _require_finite_float(
+            general_settings.get("hydro_capacity_factor"),
+            "general.csv[hydro_capacity_factor]",
+        )
+        hydro_capacity_factor = float(np.clip(hydro_capacity_factor, 0.0, 1.0))
 
     _require_columns(nodes_df, ["zone"], Path("nodes_df"))
     zones = nodes_df["zone"].astype(str).tolist()
@@ -1189,57 +2174,32 @@ def build_case_network(
         capacity_df = load_generator_capacity_from_csv(csv_capacity)
     if storage_df is None:
         storage_df = load_storage_capacity_from_csv(csv_storage)
+    if hydro_assets_df is None:
+        hydro_assets_df = load_hydro_assets_from_csv(csv_hydro_assets)
     if hydrogen_df is None and enable_hydrogen:
         hydrogen_df = load_hydrogen_assets_from_csv(csv_hydrogen)
     if not enable_hydrogen:
         hydrogen_df = None
+    if ptx_assets_df is None and enable_ptx and enable_hydrogen:
+        ptx_assets_df = load_ptx_assets_from_csv(csv_ptx_assets)
+    if ptx_monthly_demand_df is None and enable_ptx and enable_hydrogen:
+        ptx_monthly_demand_df = load_ptx_monthly_demand_from_csv(csv_ptx_monthly_demand)
+    if not (enable_ptx and enable_hydrogen):
+        ptx_assets_df = None
+        ptx_monthly_demand_df = None
 
     costs_df = load_technology_costs_from_csv(csv_costs)
     costs_df = _project_costs_for_year(costs_df, model_year)
     capacity_df, storage_df = _apply_cost_defaults(capacity_df, storage_df, costs_df)
 
-    default_costs = {
-        "wind_capital": 1200,
-        "solar_capital": 650,
-        "ocgt_marginal": 140,
-        "ocgt_eff": 0.38,
-        "bess_capital": 75000,
-        "bess_marginal": 0,
-        "bess_max_hours": 4,
-        "bess_eff_store": 0.95,
-        "bess_eff_dispatch": 0.95,
-        "bess_standing_loss": 0.001,
-        "electrolyzer_capital": 90000,
-        "electrolyzer_marginal": 0,
-        "electrolyzer_eff": 0.70,
-        "h2_fuel_cell_capital": 100000,
-        "h2_fuel_cell_marginal": 0,
-        "h2_fuel_cell_eff": 0.55,
-        "h2_turbine_capital": 85000,
-        "h2_turbine_marginal": 0,
-        "h2_turbine_eff": 0.45,
-        "h2_tank_capital": 2500,
-        "h2_tank_marginal": 0,
-        "h2_tank_standing_loss": 0.0005,
-        "uhs_injection_capital": 20000,
-        "uhs_injection_marginal": 0,
-        "uhs_injection_eff": 0.98,
-        "uhs_withdrawal_capital": 25000,
-        "uhs_withdrawal_marginal": 0,
-        "uhs_withdrawal_eff": 0.98,
-        "uhs_storage_capital": 1200,
-        "uhs_storage_marginal": 0,
-        "uhs_storage_standing_loss": 0.0001,
-        "natural_gas_marginal": 45.0,
-        "gas_boiler_eff": 0.90,
-        "gas_boiler_capital": 0.0,
-        "gas_boiler_marginal": 0.0,
-        "heat_pump_cop": 3.0,
-        "heat_pump_capital": 65000.0,
-        "heat_pump_marginal": 0.0,
-    }
+    hydro_asset_lookup = {}
+    if hydro_assets_df is not None and not hydro_assets_df.empty:
+        hydro_asset_lookup = hydro_assets_df.set_index("asset_id", drop=False).to_dict("index")
+
     if costs_overrides is not None:
-        default_costs.update(costs_overrides)
+        raise ValueError(
+            "costs_overrides is disabled in the strict config. Put scenario-specific costs in costs.csv instead."
+        )
 
     carriers = {"electricity", "bess", "slack"}
     if heat_load is not None and not heat_load.empty:
@@ -1257,22 +2217,76 @@ def build_case_network(
                 "uhs_storage",
             }
         )
+    # Diagnostic PtX shortfall slack is enabled only when its penalty cost is
+    # explicitly provided as an enabled row in general.csv. No separate
+    # enable_ptx_shortfall_slack switch and no hidden default are used.
+    enable_ptx_shortfall_slack = False
+    ptx_shortfall_cost_per_ton = None
+    if general_settings and "ptx_shortfall_cost_per_ton" in general_settings:
+        raw_value = general_settings.get("ptx_shortfall_cost_per_ton")
+        ptx_shortfall_cost_per_ton = _require_finite_float(
+            raw_value,
+            "general.csv[ptx_shortfall_cost_per_ton]",
+        )
+        if ptx_shortfall_cost_per_ton <= 0:
+            raise ValueError(f"ptx_shortfall_cost_per_ton must be positive. Got {ptx_shortfall_cost_per_ton}.")
+        enable_ptx_shortfall_slack = True
+    if enable_ptx and enable_hydrogen:
+        carriers.update(
+            {
+                "nitrogen",
+                "co2",
+                "ammonia",
+                "methanol",
+                "asu",
+                "dac",
+                "ammonia_synthesis",
+                "methanol_synthesis",
+                "ammonia_storage",
+                "methanol_storage",
+                "ammonia_export",
+                "methanol_export",
+            }
+        )
+        if enable_ptx_shortfall_slack:
+            carriers.add("ptx_shortfall")
+    if storage_df is not None and not storage_df.empty:
+        if "technology" in storage_df.columns:
+            storage_carriers = storage_df["technology"].map(_normalize_label)
+        elif "storage" in storage_df.columns:
+            storage_carriers = storage_df["storage"].map(_normalize_label)
+        else:
+            storage_carriers = pd.Series(["bess"] * len(storage_df))
+        carriers.update([c for c in storage_carriers.dropna().unique().tolist() if c])
     if capacity_df is not None and "generator" in capacity_df.columns:
-        carriers.update(capacity_df["generator"].astype(str).unique().tolist())
+        if "technology" in capacity_df.columns:
+            generator_carriers = capacity_df["technology"].map(_normalize_label)
+        else:
+            generator_carriers = capacity_df["generator"].map(_normalize_label)
+        carriers.update([c for c in generator_carriers.dropna().unique().tolist() if c])
     else:
         carriers.update(["wind", "solar", "ocgt"])
+    if ptx_assets_df is not None and not ptx_assets_df.empty and "technology" in ptx_assets_df.columns:
+        ptx_carriers = ptx_assets_df["technology"].map(_normalize_label)
+        carriers.update([c for c in ptx_carriers.dropna().unique().tolist() if c])
 
     for carrier in sorted(carriers):
         n.add("Carrier", carrier)
 
     for carrier in sorted(carriers):
-        default_co2 = 0.202 if carrier == "natural_gas" else 0.0
-        n.carriers.loc[carrier, "co2_emissions"] = _get_technology_attribute(
-            costs_df,
-            carrier,
-            "co2_emissions",
-            default=default_co2,
-        )
+        if carrier == "natural_gas":
+            n.carriers.loc[carrier, "co2_emissions"] = _require_technology_attribute(
+                costs_df,
+                carrier,
+                "co2_emissions",
+            )
+        else:
+            n.carriers.loc[carrier, "co2_emissions"] = _get_technology_attribute(
+                costs_df,
+                carrier,
+                "co2_emissions",
+                default=0.0,
+            )
 
     heat_zones = set(heat_load.columns.astype(str).tolist()) if heat_load is not None and not heat_load.empty else set()
     nodes_lookup = nodes_df.set_index("zone", drop=False)
@@ -1283,6 +2297,15 @@ def build_case_network(
             hydrogen_zones.update(hydrogen_df["zone"].astype(str).tolist())
         if hydrogen_demand is not None:
             hydrogen_zones.update([str(z) for z in hydrogen_demand.columns if str(z) in zones])
+        if enable_ptx and ptx_assets_df is not None and not ptx_assets_df.empty and "zone" in ptx_assets_df.columns:
+            hydrogen_zones.update(ptx_assets_df["zone"].astype(str).tolist())
+        if enable_ptx and ptx_monthly_demand_df is not None and not ptx_monthly_demand_df.empty:
+            demand_for_year = ptx_monthly_demand_df.copy()
+            if "year" in demand_for_year.columns:
+                demand_for_year = demand_for_year[
+                    demand_for_year["year"].isna() | (demand_for_year["year"].astype("Int64") == model_year)
+                ]
+            hydrogen_zones.update(demand_for_year["zone"].astype(str).tolist())
 
     for z in zones:
         if z not in load.columns:
@@ -1300,9 +2323,13 @@ def build_case_network(
             n.add("Load", f"heat_load_{z}", bus=f"heat_{z}", p_set=heat_load[z].values)
 
             # Existing natural gas supply chain for heat demand.
-            gas_marginal = _safe_float(
-                zone_row.get("natural_gas_marginal_cost", np.nan),
-                _get_technology_attribute(costs_df, "natural_gas", "marginal_cost", default_costs["natural_gas_marginal"]),
+            gas_marginal = _require_row_or_technology_attribute(
+                zone_row,
+                "natural_gas_marginal_cost",
+                costs_df,
+                "natural_gas",
+                "marginal_cost",
+                context=f"Node {z}",
             )
             n.add(
                 "Generator",
@@ -1313,17 +2340,29 @@ def build_case_network(
                 marginal_cost=gas_marginal,
             )
 
-            gas_boiler_eff = _safe_float(
-                zone_row.get("gas_boiler_efficiency", np.nan),
-                _get_technology_attribute(costs_df, "gas_boiler", "efficiency", default_costs["gas_boiler_eff"]),
+            gas_boiler_eff = _require_row_or_technology_attribute(
+                zone_row,
+                "gas_boiler_efficiency",
+                costs_df,
+                "gas_boiler",
+                "efficiency",
+                context=f"Node {z}",
             )
-            gas_boiler_capital = _safe_float(
-                zone_row.get("gas_boiler_capital_cost", np.nan),
-                _get_technology_attribute(costs_df, "gas_boiler", "capital_cost", default_costs["gas_boiler_capital"]),
+            gas_boiler_capital = _require_row_or_technology_attribute(
+                zone_row,
+                "gas_boiler_capital_cost",
+                costs_df,
+                "gas_boiler",
+                "capital_cost",
+                context=f"Node {z}",
             )
-            gas_boiler_marginal = _safe_float(
-                zone_row.get("gas_boiler_marginal_cost", np.nan),
-                _get_technology_attribute(costs_df, "gas_boiler", "marginal_cost", default_costs["gas_boiler_marginal"]),
+            gas_boiler_marginal = _require_row_or_technology_attribute(
+                zone_row,
+                "gas_boiler_marginal_cost",
+                costs_df,
+                "gas_boiler",
+                "marginal_cost",
+                context=f"Node {z}",
             )
             existing_gas_boiler_mw = _safe_float(
                 zone_row.get("existing_gas_boiler_mw", np.nan),
@@ -1344,25 +2383,43 @@ def build_case_network(
             # Heat pump is the electrification option for heat decarbonization.
             allow_heat_pump_raw = zone_row.get("allow_heat_pump", True)
             allow_heat_pump = str(allow_heat_pump_raw).strip().lower() not in {"false", "0", "no", "n"}
-            hp_available_from_year = int(_safe_float(zone_row.get("heat_pump_available_from_year", model_year), model_year))
+            hp_available_from_year = int(
+                _safe_float(zone_row.get("heat_pump_available_from_year", model_year), model_year)
+            )
             hp_expansion_allowed = allow_heat_pump and model_year >= hp_available_from_year
             installed_hp_mw = _safe_float(zone_row.get("installed_heat_pump_mw", 0.0), 0.0)
-            hp_cop = _safe_float(
-                zone_row.get("heat_pump_cop", np.nan),
-                _get_technology_attribute(costs_df, "heat_pump", "efficiency", default_costs["heat_pump_cop"]),
+            hp_cop = _require_row_or_technology_attribute(
+                zone_row,
+                "heat_pump_cop",
+                costs_df,
+                "heat_pump",
+                "efficiency",
+                context=f"Node {z}",
             )
-            hp_capital = _safe_float(
-                zone_row.get("heat_pump_capital_cost", np.nan),
-                _get_technology_attribute(costs_df, "heat_pump", "capital_cost", default_costs["heat_pump_capital"]),
+            hp_capital = _require_row_or_technology_attribute(
+                zone_row,
+                "heat_pump_capital_cost",
+                costs_df,
+                "heat_pump",
+                "capital_cost",
+                context=f"Node {z}",
             )
-            hp_marginal = _safe_float(
-                zone_row.get("heat_pump_marginal_cost", np.nan),
-                _get_technology_attribute(costs_df, "heat_pump", "marginal_cost", default_costs["heat_pump_marginal"]),
+            hp_marginal = _require_row_or_technology_attribute(
+                zone_row,
+                "heat_pump_marginal_cost",
+                costs_df,
+                "heat_pump",
+                "marginal_cost",
+                context=f"Node {z}",
             )
 
             hp_id = f"heat_pump_{z}"
             hp_p_nom_min = installed_hp_mw
-            if hp_expansion_allowed and previous_year_network is not None and hp_id in previous_year_network.links.index:
+            if (
+                hp_expansion_allowed
+                and previous_year_network is not None
+                and hp_id in previous_year_network.links.index
+            ):
                 prev_cap = _previous_nominal_capacity(previous_year_network, "links", hp_id, installed_hp_mw)
                 hp_p_nom_min = max(installed_hp_mw, prev_cap)
 
@@ -1381,7 +2438,11 @@ def build_case_network(
                 marginal_cost=hp_marginal,
             )
 
-            if hp_expansion_allowed and previous_year_network is not None and hp_id in previous_year_network.links.index:
+            if (
+                hp_expansion_allowed
+                and previous_year_network is not None
+                and hp_id in previous_year_network.links.index
+            ):
                 prev_cap = _previous_nominal_capacity(previous_year_network, "links", hp_id, installed_hp_mw)
                 if prev_cap > 0:
                     n.links.loc[hp_id, "p_nom_max"] = float(max(installed_hp_mw, prev_cap * 1.5))
@@ -1404,10 +2465,7 @@ def build_case_network(
 
         missing_h2_cols = [z for z in zones if z not in hydrogen_demand.columns]
         if missing_h2_cols:
-            raise ValueError(
-                "hydrogen_demand is missing zone columns: "
-                f"{missing_h2_cols}"
-            )
+            raise ValueError(f"hydrogen_demand is missing zone columns: {missing_h2_cols}")
 
         for z in zones:
             n.add(
@@ -1424,252 +2482,427 @@ def build_case_network(
         interlinks = []
 
     zone_set = set(zones)
+
+    def _add_directed_interlink(
+        link_id: str,
+        source_zone: str,
+        sink_zone: str,
+        existing_cap_mw: float,
+        loss_fraction: float,
+        expandable: bool,
+        discrete_expansion: bool,
+        module_capacity_mw: float,
+        min_modules: float,
+        max_modules: float,
+        max_capacity_mw: float,
+        capital_cost: float,
+        marginal_cost: float,
+        shared_capacity_with: Optional[str] = None,
+        is_bidirectional_reverse: bool = False,
+    ) -> None:
+        """Add one non-negative directional Link for a transmission corridor.
+
+        Bidirectional corridors are represented as two such links, one in each
+        direction. This avoids p_min_pu < 0, which can create artificial negative
+        objective contributions when a positive marginal_cost is multiplied by
+        negative link flow.
+        """
+        attrs = {
+            "bus0": f"elec_{source_zone}",
+            "bus1": f"elec_{sink_zone}",
+            "p_nom": float(existing_cap_mw),
+            "p_nom_extendable": bool(expandable),
+            "efficiency": 1.0 - loss_fraction,
+            "carrier": "electricity",
+            "capital_cost": float(capital_cost),
+            "marginal_cost": float(marginal_cost),
+            # Keep every directed Link non-negative. Reverse flow is represented
+            # by a second Link in the opposite direction, not by p_min_pu=-1.
+            "p_min_pu": 0.0,
+        }
+
+        if expandable:
+            attrs["p_nom_min"] = float(existing_cap_mw)
+
+            if discrete_expansion:
+                if not np.isfinite(module_capacity_mw) or module_capacity_mw <= 0:
+                    raise ValueError(f"Discrete expandable interlink {link_id} requires module_capacity_mw > 0.")
+                if not np.isfinite(max_modules) or max_modules < 0:
+                    raise ValueError(f"Discrete expandable interlink {link_id} requires max_modules >= 0.")
+                if min_modules < 0 or min_modules > max_modules:
+                    raise ValueError(f"Discrete expandable interlink {link_id} has invalid min_modules/max_modules.")
+
+                attrs["p_nom_min"] = float(existing_cap_mw + module_capacity_mw * min_modules)
+                attrs["p_nom_max"] = float(existing_cap_mw + module_capacity_mw * max_modules)
+            elif np.isfinite(max_capacity_mw):
+                if max_capacity_mw < existing_cap_mw:
+                    raise ValueError(f"Expandable interlink {link_id} has max_capacity_mw < capacity_mw.")
+                attrs["p_nom_max"] = float(max_capacity_mw)
+        else:
+            attrs["p_nom_max"] = float(existing_cap_mw)
+
+        n.add("Link", link_id, **attrs)
+
+        # Metadata used by custom constraints and output interpretation.
+        n.links.loc[link_id, "existing_capacity_mw"] = float(existing_cap_mw)
+        n.links.loc[link_id, "module_capacity_mw"] = (
+            float(module_capacity_mw) if np.isfinite(module_capacity_mw) else np.nan
+        )
+        n.links.loc[link_id, "min_modules"] = float(min_modules) if np.isfinite(min_modules) else np.nan
+        n.links.loc[link_id, "max_modules"] = float(max_modules) if np.isfinite(max_modules) else np.nan
+        n.links.loc[link_id, "is_bidirectional_reverse"] = bool(is_bidirectional_reverse)
+
+        if shared_capacity_with is not None:
+            n.links.loc[link_id, "shared_capacity_with"] = shared_capacity_with
+
+        # Only the master direction receives the integer module variable. The
+        # reverse direction, when present, is constrained to share the same p_nom.
+        if expandable and discrete_expansion and shared_capacity_with is None:
+            n.links.loc[link_id, "discrete_expansion"] = True
+
     for link_dict in interlinks:
         from_zone = str(link_dict["from_zone"])
         to_zone = str(link_dict["to_zone"])
         if from_zone not in zone_set or to_zone not in zone_set:
             continue
 
-        cap_mw = float(link_dict["capacity_mw"])
-        loss = _safe_float(link_dict.get("loss_fraction", 0), 0.0)
-
-        n.add(
-            "Link",
-            f"link_{from_zone}_to_{to_zone}",
-            bus0=f"elec_{from_zone}",
-            bus1=f"elec_{to_zone}",
-            p_nom=cap_mw,
-            p_nom_extendable=False,
-            efficiency=1 - loss,
-            carrier="electricity",
+        base_link_id = _normalize_label(
+            link_dict.get("asset_id", f"link_{from_zone}_to_{to_zone}"),
+            default=f"link_{from_zone}_to_{to_zone}",
         )
+
+        existing_cap_mw = _safe_float(link_dict.get("capacity_mw", 0.0), 0.0)
+        if existing_cap_mw < 0:
+            raise ValueError(f"Interlink {base_link_id} has negative capacity_mw: {existing_cap_mw}")
+
+        loss = _safe_float(link_dict.get("loss_fraction", 0.0), 0.0)
+        if loss < 0 or loss >= 1:
+            raise ValueError(f"Interlink {base_link_id} has invalid loss_fraction: {loss}")
+
+        expandable = bool(link_dict.get("expandable", False))
+        discrete_expansion = bool(link_dict.get("discrete_expansion", False))
+        bidirectional = bool(link_dict.get("bidirectional", False))
+        module_capacity_mw = _safe_float(link_dict.get("module_capacity_mw", np.nan), np.nan)
+        min_modules = _safe_float(link_dict.get("min_modules", 0.0), 0.0)
+        max_modules = _safe_float(link_dict.get("max_modules", np.nan), np.nan)
+        max_capacity_mw = _safe_float(link_dict.get("max_capacity_mw", np.nan), np.nan)
+        capital_cost = _safe_float(link_dict.get("capital_cost", 0.0), 0.0)
+        marginal_cost = _safe_float(link_dict.get("marginal_cost", 0.0), 0.0)
+
+        if bidirectional:
+            # A physical bidirectional corridor is represented by two one-way
+            # links with the same optimized capacity. Capex is charged once, on
+            # the forward/master direction only.
+            forward_id = f"{base_link_id}_fwd"
+            reverse_id = f"{base_link_id}_rev"
+
+            _add_directed_interlink(
+                link_id=forward_id,
+                source_zone=from_zone,
+                sink_zone=to_zone,
+                existing_cap_mw=existing_cap_mw,
+                loss_fraction=loss,
+                expandable=expandable,
+                discrete_expansion=discrete_expansion,
+                module_capacity_mw=module_capacity_mw,
+                min_modules=min_modules,
+                max_modules=max_modules,
+                max_capacity_mw=max_capacity_mw,
+                capital_cost=capital_cost,
+                marginal_cost=marginal_cost,
+                shared_capacity_with=None,
+                is_bidirectional_reverse=False,
+            )
+            _add_directed_interlink(
+                link_id=reverse_id,
+                source_zone=to_zone,
+                sink_zone=from_zone,
+                existing_cap_mw=existing_cap_mw,
+                loss_fraction=loss,
+                expandable=expandable,
+                discrete_expansion=False,
+                module_capacity_mw=module_capacity_mw,
+                min_modules=min_modules,
+                max_modules=max_modules,
+                max_capacity_mw=max_capacity_mw,
+                # Do not double-count investment in a single physical corridor.
+                capital_cost=0.0,
+                marginal_cost=marginal_cost,
+                shared_capacity_with=forward_id,
+                is_bidirectional_reverse=True,
+            )
+        else:
+            _add_directed_interlink(
+                link_id=base_link_id,
+                source_zone=from_zone,
+                sink_zone=to_zone,
+                existing_cap_mw=existing_cap_mw,
+                loss_fraction=loss,
+                expandable=expandable,
+                discrete_expansion=discrete_expansion,
+                module_capacity_mw=module_capacity_mw,
+                min_modules=min_modules,
+                max_modules=max_modules,
+                max_capacity_mw=max_capacity_mw,
+                capital_cost=capital_cost,
+                marginal_cost=marginal_cost,
+                shared_capacity_with=None,
+                is_bidirectional_reverse=False,
+            )
 
     if capacity_df is not None:
         for _, row in capacity_df.iterrows():
-            zone = str(row["zone"])
+            zone = str(row["zone"]).strip()
             if zone not in zone_set:
                 continue
 
-            gen_name = str(row["generator"])
+            asset_name = _generator_asset_name(row)
+            technology = _generator_technology(row)
+            gen_id = _generator_asset_id(row, zone)
+
             installed_cap = _safe_float(row.get("installed_capacity", 0), 0.0)
-            capital_cost = _safe_float(row.get("capital_cost", np.nan), 0.0)
-            marginal_cost = _safe_float(row.get("marginal_cost", np.nan), 0.0)
-            efficiency = _safe_float(row.get("efficiency", np.nan), 1.0)
+            if installed_cap < 0:
+                raise ValueError(f"Generator {gen_id} has negative installed_capacity: {installed_cap}")
+
+            capital_cost = _require_row_float(row, "capital_cost", f"Generator {gen_id}")
+            marginal_cost = _require_row_float(row, "marginal_cost", f"Generator {gen_id}")
+            efficiency = _require_row_float(row, "efficiency", f"Generator {gen_id}")
             p_min_mw = _safe_float(row.get("p_min_mw", 0), 0.0)
-            hydro_cf = _safe_float(
-                row.get("capacity_factor", np.nan),
-                _safe_float(row.get("availability_factor", np.nan), hydro_capacity_factor),
+            hydro_cf = np.nan
+            if _is_hydro_technology(technology):
+                if "capacity_factor" in row.index and not pd.isna(row.get("capacity_factor")):
+                    hydro_cf = _require_finite_float(row.get("capacity_factor"), f"Generator {gen_id}.capacity_factor")
+                elif "availability_factor" in row.index and not pd.isna(row.get("availability_factor")):
+                    hydro_cf = _require_finite_float(
+                        row.get("availability_factor"), f"Generator {gen_id}.availability_factor"
+                    )
+                elif hydro_capacity_factor is not None:
+                    hydro_cf = hydro_capacity_factor
+                else:
+                    raise ValueError(
+                        f"Hydro generator {gen_id} requires capacity_factor or availability_factor "
+                        "in generators_capacity.csv, or hydro_capacity_factor in general.csv."
+                    )
+
+            is_available, expansion_allowed, commissioning_status, commissioning_year = (
+                _resolve_generator_commissioning(row, model_year)
             )
-            earliest_commissioning_year = _safe_year(row.get("earliest_commissioning_year", np.nan))
-            if earliest_commissioning_year is None:
-                earliest_commissioning_year = _safe_year(row.get("available_from_year", np.nan))
-            fixed_commissioning_year = _safe_year(row.get("fixed_commissioning_year", np.nan))
+            if not is_available:
+                continue
 
-            commissioning_type = str(row.get("commissioning_type", "")).strip().lower()
-            hinted_fixed = commissioning_type == "fixed"
-            fixed_defined = fixed_commissioning_year is not None or hinted_fixed
-
-            if fixed_defined:
-                fixed_year = fixed_commissioning_year if fixed_commissioning_year is not None else earliest_commissioning_year
-                if fixed_year is None:
-                    fixed_year = model_year
-                if model_year < fixed_year:
-                    continue
-                expansion_allowed = False
-            else:
-                # Skip flexible generators that haven't reached their commissioning year yet.
-                # Without this, they are added as fixed capacity (p_nom = installed_cap)
-                # even though they're not built yet.
-                if earliest_commissioning_year is not None and model_year < earliest_commissioning_year:
-                    continue
-                expansion_allowed = earliest_commissioning_year is not None and model_year >= earliest_commissioning_year
-
-            gen_id = f"{gen_name}_{zone}"
             use_unit_commitment = p_min_mw > 0 and installed_cap > 0
+            if use_unit_commitment and expansion_allowed:
+                # PyPSA does not support committable and extendable generators together.
+                # Treat these assets as fixed/committed once available.
+                expansion_allowed = False
+                commissioning_status = "fixed_committable"
 
-            # Expandable generators: optimizer decides build amount from 0 to installed_cap.
-            # Existing/fixed generators: always hold their full installed_cap.
-            effectively_expandable = expansion_allowed and not use_unit_commitment
-            linked_p_nom_min = 0.0 if effectively_expandable else installed_cap
-            if effectively_expandable:
-                if (
-                    previous_year_network is not None
-                    and gen_id in previous_year_network.generators.index
-                ):
-                    # Year-linked: don't allow built capacity to decrease.
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "generators", gen_id, installed_cap)
-                    linked_p_nom_min = prev_cap
-            elif (
-                expansion_allowed
-                and previous_year_network is not None
-                and gen_id in previous_year_network.generators.index
-            ):
-                prev_cap = _previous_nominal_capacity(previous_year_network, "generators", gen_id, installed_cap)
-                linked_p_nom_min = max(installed_cap, prev_cap)
+            previous_cap = None
+            if previous_year_network is not None and gen_id in previous_year_network.generators.index:
+                previous_cap = _previous_nominal_capacity(
+                    previous_year_network,
+                    "generators",
+                    gen_id,
+                    installed_cap,
+                )
+
+            if expansion_allowed:
+                # Flexible/candidate assets: installed_capacity is the cumulative upper bound
+                # for this model year; year-linking prevents already-built capacity from decreasing.
+                linked_p_nom_min = max(0.0, previous_cap or 0.0)
+                p_nom_max = max(installed_cap, linked_p_nom_min)
+                # p_nom = max(installed_cap, linked_p_nom_min)
+                p_nom = linked_p_nom_min
+            else:
+                # Fixed/existing/committed assets: installed_capacity is enforced. If year-linking
+                # has already built more under the same asset_id, keep the larger value.
+                fixed_cap = max(installed_cap, previous_cap or 0.0)
+                linked_p_nom_min = fixed_cap
+                p_nom_max = fixed_cap
+                p_nom = fixed_cap
+
+            hydro_config = hydro_asset_lookup.get(gen_id)
+            if hydro_config is not None:
+                _add_csv_driven_hydro_asset(
+                    n=n,
+                    snapshots=snapshots,
+                    generator_row=row,
+                    hydro_row=pd.Series(hydro_config),
+                    hydro_inflows=hydro_inflows,
+                    gen_id=gen_id,
+                    zone=zone,
+                    technology=technology,
+                    p_nom=float(p_nom),
+                    p_nom_min=float(linked_p_nom_min),
+                    p_nom_max=float(p_nom_max),
+                    expansion_allowed=bool(expansion_allowed),
+                    capital_cost=capital_cost,
+                    marginal_cost=marginal_cost,
+                    efficiency=efficiency,
+                    commissioning_status=commissioning_status,
+                    commissioning_year=commissioning_year,
+                )
+                continue
 
             attrs = {
                 "bus": f"elec_{zone}",
-                "carrier": gen_name,
-                "p_nom": installed_cap,
-                "p_nom_min": linked_p_nom_min,
-                "p_nom_extendable": expansion_allowed and not use_unit_commitment,
+                "carrier": technology,
+                "p_nom": float(p_nom),
+                "p_nom_min": float(linked_p_nom_min),
+                "p_nom_extendable": bool(expansion_allowed),
                 "capital_cost": capital_cost,
                 "marginal_cost": marginal_cost,
+                "efficiency": efficiency,
             }
 
-            if not expansion_allowed:
-                attrs["p_nom_max"] = installed_cap
-            elif not use_unit_commitment:
-                # Cap the optimizer at the scenario's planned capacity.
-                # (For year-linked runs the post-add block may raise this to prev_cap * 1.5.)
-                attrs["p_nom_max"] = installed_cap
+            attrs["p_nom_max"] = float(p_nom_max)
 
-            if efficiency != 1.0:
-                attrs["efficiency"] = efficiency
-
-            if p_min_mw > 0 and installed_cap > 0:
-                attrs["p_min_pu"] = min(1.0, p_min_mw / installed_cap)
+            if p_min_mw > 0 and p_nom > 0:
+                attrs["p_min_pu"] = min(1.0, p_min_mw / p_nom)
 
             if use_unit_commitment:
-                # Enable on/off operation with minimum output only when unit is on.
+                # Enable on/off operation with minimum output only when the unit is on.
                 attrs["committable"] = True
                 attrs["p_nom_extendable"] = False
-                attrs["p_nom_min"] = installed_cap
-                attrs["p_nom_max"] = installed_cap
+                attrs["p_nom_min"] = float(p_nom)
+                attrs["p_nom_max"] = float(p_nom)
 
-            if vre_profiles is not None and gen_name in vre_profiles and zone in vre_profiles[gen_name].columns:
-                attrs["p_max_pu"] = vre_profiles[gen_name][zone].values
-            elif gen_name.lower().startswith("hydro"):
+            profile_key = _technology_profile_key(technology)
+            if (
+                profile_key is not None
+                and vre_profiles is not None
+                and profile_key in vre_profiles
+                and zone in vre_profiles[profile_key].columns
+            ):
+                attrs["p_max_pu"] = vre_profiles[profile_key][zone].values
+            elif profile_key is not None:
+                print(
+                    f"Warning: {gen_id} has technology='{technology}' but no {profile_key} "
+                    f"profile was found for zone='{zone}'. It will be treated as dispatchable."
+                )
+            elif _is_hydro_technology(technology):
                 attrs["p_max_pu"] = np.full(len(snapshots), hydro_cf)
 
             n.add("Generator", gen_id, **attrs)
-
-            if (
-                expansion_allowed
-                and previous_year_network is not None
-                and gen_id in previous_year_network.generators.index
-            ):
-                prev_cap = _previous_nominal_capacity(previous_year_network, "generators", gen_id, installed_cap)
-                if prev_cap > 0:
-                    n.generators.loc[gen_id, "p_nom_max"] = max(installed_cap, prev_cap * 1.5)
     else:
-        for z in zones:
-            if vre_profiles is not None and "wind" in vre_profiles and z in vre_profiles["wind"].columns:
-                n.add(
-                    "Generator",
-                    f"wind_{z}",
-                    bus=f"elec_{z}",
-                    carrier="wind",
-                    p_nom_extendable=True,
-                    p_max_pu=vre_profiles["wind"][z].values,
-                    capital_cost=default_costs["wind_capital"],
-                    marginal_cost=0.0,
-                )
-
-            if vre_profiles is not None and "solar" in vre_profiles and z in vre_profiles["solar"].columns:
-                n.add(
-                    "Generator",
-                    f"solar_{z}",
-                    bus=f"elec_{z}",
-                    carrier="solar",
-                    p_nom_extendable=True,
-                    p_max_pu=vre_profiles["solar"][z].values,
-                    capital_cost=default_costs["solar_capital"],
-                    marginal_cost=0.0,
-                )
-
-            n.add(
-                "Generator",
-                f"ocgt_{z}",
-                bus=f"elec_{z}",
-                carrier="ocgt",
-                p_nom_extendable=True,
-                efficiency=default_costs["ocgt_eff"],
-                marginal_cost=default_costs["ocgt_marginal"],
-            )
+        raise ValueError(
+            "Generator capacity input is required. "
+            "No built-in wind/solar/OCGT fallback fleet is created in the strict config."
+        )
 
     if storage_df is not None:
         for _, row in storage_df.iterrows():
-            zone = str(row["zone"])
+            zone = str(row["zone"]).strip()
             if zone not in zone_set:
                 continue
 
-            storage_id = f"bess_{zone}"
+            technology = _normalize_label(row.get("technology", "bess"), default="bess")
             installed_power_mw = _safe_float(row.get("installed_power_mw", 0), 0.0)
-            max_hours = _safe_float(row.get("max_hours", np.nan), default_costs["bess_max_hours"])
-            capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["bess_capital"])
-            marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["bess_marginal"])
-            efficiency_store = _safe_float(
-                row.get("efficiency_store", np.nan), default_costs["bess_eff_store"]
-            )
-            efficiency_dispatch = _safe_float(
-                row.get("efficiency_dispatch", np.nan), default_costs["bess_eff_dispatch"]
-            )
-            standing_loss = _safe_float(
-                row.get("standing_loss", np.nan), default_costs["bess_standing_loss"]
-            )
-            available_from_year = int(_safe_float(row.get("available_from_year", model_year), model_year))
-            expansion_allowed = model_year >= available_from_year
+            if installed_power_mw < 0:
+                raise ValueError(f"Storage asset in zone {zone} has negative installed_power_mw: {installed_power_mw}")
 
-            p_nom_min = installed_power_mw
+            max_hours = _require_row_float(row, "max_hours", f"Storage asset in zone {zone}")
+            if max_hours <= 0:
+                raise ValueError(f"Storage asset in zone {zone} requires max_hours > 0.")
+
+            storage_id = _storage_asset_id(row, zone=zone, max_hours=max_hours, technology=technology)
+            capital_cost = _require_row_float(row, "capital_cost", f"Storage asset {storage_id}")
+            marginal_cost = _require_row_float(row, "marginal_cost", f"Storage asset {storage_id}")
+            efficiency_store = _require_row_float(row, "efficiency_store", f"Storage asset {storage_id}")
+            efficiency_dispatch = _require_row_float(row, "efficiency_dispatch", f"Storage asset {storage_id}")
+            standing_loss = _require_row_float(row, "standing_loss", f"Storage asset {storage_id}")
+
+            is_available, expansion_allowed, commissioning_status, commissioning_year = (
+                _resolve_generator_commissioning(row, model_year)
+            )
+            if not is_available:
+                continue
+
+            previous_power = None
             if previous_year_network is not None and storage_id in previous_year_network.storage_units.index:
-                prev_power = _previous_nominal_capacity(
+                previous_power = _previous_nominal_capacity(
                     previous_year_network,
                     "storage_units",
                     storage_id,
                     installed_power_mw,
                 )
-                p_nom_min = max(p_nom_min, prev_power)
+
+            if expansion_allowed:
+                linked_p_nom_min = max(0.0, installed_power_mw, previous_power or 0.0)
+                explicit_max_power = _optional_upper_bound(
+                    row,
+                    ["max_power_mw", "p_nom_max_mw", "installed_power_max_mw"],
+                )
+                p_nom = linked_p_nom_min
+                p_nom_max = _upper_bound_or_nan(linked_p_nom_min, explicit_max_power)
+            else:
+                fixed_power = max(installed_power_mw, previous_power or 0.0)
+                linked_p_nom_min = fixed_power
+                p_nom = fixed_power
+                p_nom_max = fixed_power
+
+            cyclic_state_of_charge = _as_bool(
+                row.get("cyclic_state_of_charge", False),
+                default=False,
+                context=f"Storage asset {storage_id}.cyclic_state_of_charge",
+            )
+            initial_soc_fraction = _fraction_from_row(
+                row,
+                "initial_soc_fraction",
+                default=0.0,
+                context=f"Storage asset {storage_id}",
+            )
+
+            # PyPSA uses an absolute initial energy value (MWh), not a fraction.
+            # For an extendable StorageUnit, a non-zero fraction cannot be
+            # converted before p_nom_opt is known. Cyclic operation does not use
+            # state_of_charge_initial, so it remains valid for extendable BESS.
+            if expansion_allowed and not cyclic_state_of_charge and initial_soc_fraction > 0.0:
+                raise ValueError(
+                    f"Storage asset {storage_id} is extendable and has "
+                    f"initial_soc_fraction={initial_soc_fraction}. Use "
+                    "cyclic_state_of_charge=TRUE, set the fraction to 0, or add "
+                    "an explicit optimization constraint for a non-zero fraction."
+                )
+
+            state_of_charge_initial = (
+                0.0 if cyclic_state_of_charge else initial_soc_fraction * float(p_nom) * float(max_hours)
+            )
 
             n.add(
                 "StorageUnit",
                 storage_id,
                 bus=f"elec_{zone}",
-                carrier="bess",
-                p_nom=installed_power_mw,
-                p_nom_min=p_nom_min,
-                p_nom_extendable=expansion_allowed,
-                max_hours=max_hours,
+                carrier=technology,
+                p_nom=float(p_nom),
+                p_nom_min=float(linked_p_nom_min),
+                p_nom_extendable=bool(expansion_allowed),
+                max_hours=float(max_hours),
                 capital_cost=capital_cost,
                 marginal_cost=marginal_cost,
                 efficiency_store=efficiency_store,
                 efficiency_dispatch=efficiency_dispatch,
                 standing_loss=standing_loss,
+                cyclic_state_of_charge=cyclic_state_of_charge,
+                state_of_charge_initial=state_of_charge_initial,
             )
 
-            if not expansion_allowed:
-                n.storage_units.loc[storage_id, "p_nom_max"] = installed_power_mw
+            if np.isfinite(p_nom_max):
+                n.storage_units.loc[storage_id, "p_nom_max"] = float(p_nom_max)
 
-            if (
-                expansion_allowed
-                and previous_year_network is not None
-                and storage_id in previous_year_network.storage_units.index
-            ):
-                prev_power = _previous_nominal_capacity(
-                    previous_year_network,
-                    "storage_units",
-                    storage_id,
-                    installed_power_mw,
-                )
-                if prev_power > 0:
-                    n.storage_units.loc[storage_id, "p_nom_max"] = max(installed_power_mw, prev_power * 1.5)
+            # Metadata for result interpretation.
+            n.storage_units.loc[storage_id, "commissioning_type"] = commissioning_status
+            n.storage_units.loc[storage_id, "commissioning_year"] = (
+                float(commissioning_year) if commissioning_year is not None else np.nan
+            )
+            n.storage_units.loc[storage_id, "initial_soc_fraction_input"] = float(initial_soc_fraction)
+            if "asset_id" in row.index and pd.notna(row.get("asset_id")):
+                n.storage_units.loc[storage_id, "source_asset_id"] = str(row.get("asset_id"))
+
     else:
-        for z in zones:
-            n.add(
-                "StorageUnit",
-                f"bess_{z}",
-                bus=f"elec_{z}",
-                carrier="bess",
-                p_nom=0.0,
-                p_nom_min=0.0,
-                p_nom_extendable=True,
-                max_hours=default_costs["bess_max_hours"],
-                capital_cost=default_costs["bess_capital"],
-                marginal_cost=default_costs["bess_marginal"],
-                efficiency_store=default_costs["bess_eff_store"],
-                efficiency_dispatch=default_costs["bess_eff_dispatch"],
-                standing_loss=default_costs["bess_standing_loss"],
-            )
+        raise ValueError(
+            "Storage capacity input is required. No built-in BESS fallback is created in the strict config."
+        )
 
     if hydrogen_df is not None and not hydrogen_df.empty:
         asset_type_alias = {
@@ -1684,131 +2917,311 @@ def build_case_network(
             "dgr": "uhs",
         }
 
+        def _add_h2_link_from_row(
+            row: pd.Series,
+            asset_type: str,
+            asset_id: str,
+            bus0: str,
+            bus1: str,
+            carrier: str,
+            installed_capacity_mw: float,
+            efficiency: float,
+            capital_cost: float,
+            marginal_cost: float,
+            expansion_allowed: bool,
+            p_max_pu=None,
+        ) -> None:
+            """Add an H2-related Link with commissioning and year-linking metadata."""
+            linked_min = installed_capacity_mw
+            if (
+                expansion_allowed
+                and previous_year_network is not None
+                and asset_id in previous_year_network.links.index
+            ):
+                prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
+                linked_min = max(installed_capacity_mw, prev_cap)
+
+            if expansion_allowed:
+                explicit_upper = _optional_upper_bound(
+                    row,
+                    ["p_nom_max_mw", "max_capacity_mw", "installed_capacity_max_mw"],
+                )
+                p_nom = linked_min
+                p_nom_max = _upper_bound_or_nan(linked_min, explicit_upper)
+            else:
+                p_nom = linked_min
+                p_nom_max = linked_min
+
+            attrs = dict(
+                bus0=bus0,
+                bus1=bus1,
+                carrier=carrier,
+                p_nom=float(p_nom),
+                p_nom_min=float(linked_min),
+                p_nom_extendable=bool(expansion_allowed),
+                efficiency=efficiency,
+                capital_cost=capital_cost,
+                marginal_cost=marginal_cost,
+            )
+            if np.isfinite(p_nom_max):
+                attrs["p_nom_max"] = float(p_nom_max)
+            if p_max_pu is not None:
+                attrs["p_max_pu"] = p_max_pu.values
+
+            n.add("Link", asset_id, **attrs)
+            n.links.loc[asset_id, "source_asset_type"] = asset_type
+
+        def _add_h2_store_from_row(
+            row: pd.Series,
+            asset_type: str,
+            asset_id: str,
+            bus: str,
+            carrier: str,
+            installed_energy_mwh: float,
+            standing_loss: float,
+            capital_cost: float,
+            marginal_cost: float,
+            expansion_allowed: bool,
+        ) -> None:
+            """Add an H2-related Store with commissioning and year-linking metadata."""
+            linked_min = installed_energy_mwh
+            if (
+                expansion_allowed
+                and previous_year_network is not None
+                and asset_id in previous_year_network.stores.index
+            ):
+                prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_mwh)
+                linked_min = max(installed_energy_mwh, prev_energy)
+
+            if expansion_allowed:
+                explicit_upper = _optional_upper_bound(
+                    row,
+                    ["e_nom_max_mwh", "max_energy_mwh", "installed_energy_max_mwh"],
+                )
+                e_nom = linked_min
+                e_nom_max = _upper_bound_or_nan(linked_min, explicit_upper)
+            else:
+                e_nom = linked_min
+                e_nom_max = linked_min
+
+            cyclic_inventory = _as_bool(
+                row.get("cyclic_inventory", False),
+                default=False,
+                context=f"Hydrogen store {asset_id}.cyclic_inventory",
+            )
+            initial_inventory_fraction = _fraction_from_row(
+                row,
+                "initial_inventory_fraction",
+                default=0.0,
+                context=f"Hydrogen store {asset_id}",
+            )
+
+            # PyPSA's e_initial is an absolute inventory (MWh). A non-zero
+            # fractional initial inventory for an extendable Store needs an
+            # additional optimization constraint because e_nom_opt is unknown
+            # when the network is built. Cyclic Stores do not use e_initial.
+            if expansion_allowed and not cyclic_inventory and initial_inventory_fraction > 0.0:
+                raise ValueError(
+                    f"Hydrogen store {asset_id} is extendable and has "
+                    f"initial_inventory_fraction={initial_inventory_fraction}. Use "
+                    "cyclic_inventory=TRUE, set the fraction to 0, or add an "
+                    "explicit optimization constraint for a non-zero fraction."
+                )
+
+            e_initial = 0.0 if cyclic_inventory else initial_inventory_fraction * float(e_nom)
+
+            attrs = dict(
+                bus=bus,
+                carrier=carrier,
+                e_nom=float(e_nom),
+                e_nom_min=float(linked_min),
+                e_nom_extendable=bool(expansion_allowed),
+                standing_loss=standing_loss,
+                capital_cost=capital_cost,
+                marginal_cost=marginal_cost,
+                e_cyclic=cyclic_inventory,
+                e_initial=e_initial,
+            )
+            if np.isfinite(e_nom_max):
+                attrs["e_nom_max"] = float(e_nom_max)
+
+            n.add("Store", asset_id, **attrs)
+            n.stores.loc[asset_id, "source_asset_type"] = asset_type
+            n.stores.loc[asset_id, "initial_inventory_fraction_input"] = float(initial_inventory_fraction)
+
         for _, row in hydrogen_df.iterrows():
-            zone = str(row["zone"])
+            zone = str(row["zone"]).strip()
             if zone not in zone_set:
                 continue
 
             raw_asset_type = str(row["asset_type"]).strip().lower()
             asset_type = asset_type_alias.get(raw_asset_type, raw_asset_type)
-            available_from_year = int(_safe_float(row.get("available_from_year", model_year), model_year))
-            expansion_allowed = model_year >= available_from_year
+
+            is_available, expansion_allowed, commissioning_status, commissioning_year = (
+                _resolve_generator_commissioning(row, model_year)
+            )
+            if not is_available:
+                continue
+
+            if (
+                asset_type
+                in {
+                    "electrolyzer",
+                    "h2_fuel_cell",
+                    "h2_turbine",
+                    "h2_store_tank",
+                    "uhs_injection",
+                    "uhs_withdrawal",
+                    "uhs_store",
+                    "uhs",
+                }
+                and f"h2_{zone}" not in n.buses.index
+            ):
+                n.add("Bus", f"h2_{zone}", carrier="hydrogen")
 
             if asset_type == "electrolyzer":
-                asset_id = f"h2_electrolyzer_{zone}"
+                asset_id = _h2_asset_id(row, asset_type, zone)
                 installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
-                efficiency = _safe_float(row.get("efficiency", np.nan), default_costs["electrolyzer_eff"])
-                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["electrolyzer_capital"])
-                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["electrolyzer_marginal"])
+                efficiency = _require_row_or_technology_attribute(
+                    row,
+                    "efficiency",
+                    costs_df,
+                    "electrolyzer",
+                    "efficiency",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
+                capital_cost = _require_row_or_technology_attribute(
+                    row,
+                    "capital_cost",
+                    costs_df,
+                    "electrolyzer",
+                    "capital_cost",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
+                marginal_cost = _require_row_or_technology_attribute(
+                    row,
+                    "marginal_cost",
+                    costs_df,
+                    "electrolyzer",
+                    "marginal_cost",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
 
-                linked_min = installed_capacity_mw
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
-                    linked_min = max(installed_capacity_mw, prev_cap)
-
-                n.add(
-                    "Link",
-                    asset_id,
+                _add_h2_link_from_row(
+                    row=row,
+                    asset_type=asset_type,
+                    asset_id=asset_id,
                     bus0=f"elec_{zone}",
                     bus1=f"h2_{zone}",
                     carrier="electrolyzer",
-                    p_nom=float(installed_capacity_mw),
-                    p_nom_min=float(linked_min),
-                    p_nom_extendable=expansion_allowed,
-                    p_nom_max=float(installed_capacity_mw) if not expansion_allowed else np.nan,
+                    installed_capacity_mw=installed_capacity_mw,
                     efficiency=efficiency,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
+                    expansion_allowed=expansion_allowed,
                 )
 
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
-                    if prev_cap > 0:
-                        n.links.loc[asset_id, "p_nom_max"] = float(max(installed_capacity_mw, prev_cap * 1.5))
-
             elif asset_type in {"h2_fuel_cell", "h2_turbine"}:
-                asset_id = f"{asset_type}_{zone}"
+                asset_id = _h2_asset_id(row, asset_type, zone)
                 installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
 
-                if asset_type == "h2_fuel_cell":
-                    default_eff = default_costs["h2_fuel_cell_eff"]
-                    default_capital = default_costs["h2_fuel_cell_capital"]
-                    default_marginal = default_costs["h2_fuel_cell_marginal"]
-                else:
-                    default_eff = default_costs["h2_turbine_eff"]
-                    default_capital = default_costs["h2_turbine_capital"]
-                    default_marginal = default_costs["h2_turbine_marginal"]
+                cost_technology = asset_type
+                efficiency = _require_row_or_technology_attribute(
+                    row, "efficiency", costs_df, cost_technology, "efficiency", context=asset_id
+                )
+                capital_cost = _require_row_or_technology_attribute(
+                    row, "capital_cost", costs_df, cost_technology, "capital_cost", context=asset_id
+                )
+                marginal_cost = _require_row_or_technology_attribute(
+                    row, "marginal_cost", costs_df, cost_technology, "marginal_cost", context=asset_id
+                )
 
-                efficiency = _safe_float(row.get("efficiency", np.nan), default_eff)
-                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_capital)
-                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_marginal)
-
-                linked_min = installed_capacity_mw
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
-                    linked_min = max(installed_capacity_mw, prev_cap)
-
-                n.add(
-                    "Link",
-                    asset_id,
+                _add_h2_link_from_row(
+                    row=row,
+                    asset_type=asset_type,
+                    asset_id=asset_id,
                     bus0=f"h2_{zone}",
                     bus1=f"elec_{zone}",
                     carrier=asset_type,
-                    p_nom=float(installed_capacity_mw),
-                    p_nom_min=float(linked_min),
-                    p_nom_extendable=expansion_allowed,
-                    p_nom_max=float(installed_capacity_mw) if not expansion_allowed else np.nan,
+                    installed_capacity_mw=installed_capacity_mw,
                     efficiency=efficiency,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
+                    expansion_allowed=expansion_allowed,
                 )
 
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
-                    if prev_cap > 0:
-                        n.links.loc[asset_id, "p_nom_max"] = float(max(installed_capacity_mw, prev_cap * 1.5))
-
             elif asset_type == "h2_store_tank":
-                asset_id = f"h2_store_{zone}"
+                asset_id = _h2_asset_id(row, asset_type, zone)
                 installed_energy_mwh = _safe_float(row.get("installed_energy_mwh", 0.0), 0.0)
-                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["h2_tank_capital"])
-                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["h2_tank_marginal"])
-                standing_loss = _safe_float(row.get("standing_loss", np.nan), default_costs["h2_tank_standing_loss"])
+                capital_cost = _require_row_or_technology_attribute(
+                    row,
+                    "capital_cost",
+                    costs_df,
+                    "h2_tank",
+                    "capital_cost",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
+                marginal_cost = _require_row_or_technology_attribute(
+                    row,
+                    "marginal_cost",
+                    costs_df,
+                    "h2_tank",
+                    "marginal_cost",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
+                standing_loss = _require_row_or_technology_attribute(
+                    row,
+                    "standing_loss",
+                    costs_df,
+                    "h2_tank",
+                    "standing_loss",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
 
-                linked_min = installed_energy_mwh
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.stores.index:
-                    prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_mwh)
-                    linked_min = max(installed_energy_mwh, prev_energy)
-
-                n.add(
-                    "Store",
-                    asset_id,
+                _add_h2_store_from_row(
+                    row=row,
+                    asset_type=asset_type,
+                    asset_id=asset_id,
                     bus=f"h2_{zone}",
                     carrier="hydrogen_storage",
-                    e_nom=float(installed_energy_mwh),
-                    e_nom_min=float(linked_min),
-                    e_nom_extendable=expansion_allowed,
-                    e_nom_max=float(installed_energy_mwh) if not expansion_allowed else np.nan,
+                    installed_energy_mwh=installed_energy_mwh,
                     standing_loss=standing_loss,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
+                    expansion_allowed=expansion_allowed,
                 )
-
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.stores.index:
-                    prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_mwh)
-                    if prev_energy > 0:
-                        n.stores.loc[asset_id, "e_nom_max"] = float(max(installed_energy_mwh, prev_energy * 1.5))
 
             elif asset_type == "uhs_injection":
                 uhs_bus_id = f"uhs_{zone}"
                 if uhs_bus_id not in n.buses.index:
                     n.add("Bus", uhs_bus_id, carrier="uhs_storage")
 
-                asset_id = f"uhs_injection_{zone}"
+                asset_id = _h2_asset_id(row, asset_type, zone)
                 installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
-                efficiency = _safe_float(row.get("efficiency", np.nan), default_costs["uhs_injection_eff"])
-                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_injection_capital"])
-                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_injection_marginal"])
+                efficiency = _require_row_or_technology_attribute(
+                    row,
+                    "efficiency",
+                    costs_df,
+                    "uhs_injection",
+                    "efficiency",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
+                capital_cost = _require_row_or_technology_attribute(
+                    row,
+                    "capital_cost",
+                    costs_df,
+                    "uhs_injection",
+                    "capital_cost",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
+                marginal_cost = _require_row_or_technology_attribute(
+                    row,
+                    "marginal_cost",
+                    costs_df,
+                    "uhs_injection",
+                    "marginal_cost",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
 
                 continuous_op = int(_safe_float(row.get("continuous_operation", 0), 0))
                 inj_season_start = _safe_float(row.get("injection_season_start", np.nan), np.nan)
@@ -1817,42 +3230,52 @@ def build_case_network(
                 if continuous_op == 1 and not pd.isna(inj_season_start) and not pd.isna(inj_season_days):
                     inj_p_max_pu = _build_seasonal_mask(snapshots, int(inj_season_start), int(inj_season_days))
 
-                linked_min = installed_capacity_mw
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
-                    linked_min = max(installed_capacity_mw, prev_cap)
-
-                inj_link_attrs = dict(
+                _add_h2_link_from_row(
+                    row=row,
+                    asset_type=asset_type,
+                    asset_id=asset_id,
                     bus0=f"h2_{zone}",
                     bus1=uhs_bus_id,
                     carrier="uhs_injection",
-                    p_nom=float(installed_capacity_mw),
-                    p_nom_min=float(linked_min),
-                    p_nom_extendable=expansion_allowed,
-                    p_nom_max=float(installed_capacity_mw) if not expansion_allowed else np.nan,
+                    installed_capacity_mw=installed_capacity_mw,
                     efficiency=efficiency,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
+                    expansion_allowed=expansion_allowed,
+                    p_max_pu=inj_p_max_pu,
                 )
-                if inj_p_max_pu is not None:
-                    inj_link_attrs["p_max_pu"] = inj_p_max_pu.values
-                n.add("Link", asset_id, **inj_link_attrs)
-
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
-                    if prev_cap > 0:
-                        n.links.loc[asset_id, "p_nom_max"] = float(max(installed_capacity_mw, prev_cap * 1.5))
 
             elif asset_type == "uhs_withdrawal":
                 uhs_bus_id = f"uhs_{zone}"
                 if uhs_bus_id not in n.buses.index:
                     n.add("Bus", uhs_bus_id, carrier="uhs_storage")
 
-                asset_id = f"uhs_withdrawal_{zone}"
+                asset_id = _h2_asset_id(row, asset_type, zone)
                 installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
-                efficiency = _safe_float(row.get("efficiency", np.nan), default_costs["uhs_withdrawal_eff"])
-                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_withdrawal_capital"])
-                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_withdrawal_marginal"])
+                efficiency = _require_row_or_technology_attribute(
+                    row,
+                    "efficiency",
+                    costs_df,
+                    "uhs_withdrawal",
+                    "efficiency",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
+                capital_cost = _require_row_or_technology_attribute(
+                    row,
+                    "capital_cost",
+                    costs_df,
+                    "uhs_withdrawal",
+                    "capital_cost",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
+                marginal_cost = _require_row_or_technology_attribute(
+                    row,
+                    "marginal_cost",
+                    costs_df,
+                    "uhs_withdrawal",
+                    "marginal_cost",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
 
                 continuous_op = int(_safe_float(row.get("continuous_operation", 0), 0))
                 wdr_season_start = _safe_float(row.get("withdrawal_season_start", np.nan), np.nan)
@@ -1861,145 +3284,176 @@ def build_case_network(
                 if continuous_op == 1 and not pd.isna(wdr_season_start) and not pd.isna(wdr_season_days):
                     wdr_p_max_pu = _build_seasonal_mask(snapshots, int(wdr_season_start), int(wdr_season_days))
 
-                linked_min = installed_capacity_mw
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
-                    linked_min = max(installed_capacity_mw, prev_cap)
-
-                wdr_link_attrs = dict(
+                _add_h2_link_from_row(
+                    row=row,
+                    asset_type=asset_type,
+                    asset_id=asset_id,
                     bus0=uhs_bus_id,
                     bus1=f"h2_{zone}",
                     carrier="uhs_withdrawal",
-                    p_nom=float(installed_capacity_mw),
-                    p_nom_min=float(linked_min),
-                    p_nom_extendable=expansion_allowed,
-                    p_nom_max=float(installed_capacity_mw) if not expansion_allowed else np.nan,
+                    installed_capacity_mw=installed_capacity_mw,
                     efficiency=efficiency,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
+                    expansion_allowed=expansion_allowed,
+                    p_max_pu=wdr_p_max_pu,
                 )
-                if wdr_p_max_pu is not None:
-                    wdr_link_attrs["p_max_pu"] = wdr_p_max_pu.values
-                n.add("Link", asset_id, **wdr_link_attrs)
-
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
-                    if prev_cap > 0:
-                        n.links.loc[asset_id, "p_nom_max"] = float(max(installed_capacity_mw, prev_cap * 1.5))
 
             elif asset_type == "uhs_store":
                 uhs_bus_id = f"uhs_{zone}"
                 if uhs_bus_id not in n.buses.index:
                     n.add("Bus", uhs_bus_id, carrier="uhs_storage")
 
-                asset_id = f"uhs_store_{zone}"
+                asset_id = _h2_asset_id(row, asset_type, zone)
                 installed_energy_mwh = _safe_float(row.get("installed_energy_mwh", 0.0), 0.0)
-                capital_cost = _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_storage_capital"])
-                marginal_cost = _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_storage_marginal"])
-                standing_loss = _safe_float(row.get("standing_loss", np.nan), default_costs["uhs_storage_standing_loss"])
+                capital_cost = _require_row_or_technology_attribute(
+                    row,
+                    "capital_cost",
+                    costs_df,
+                    "uhs_storage",
+                    "capital_cost",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
+                marginal_cost = _require_row_or_technology_attribute(
+                    row,
+                    "marginal_cost",
+                    costs_df,
+                    "uhs_storage",
+                    "marginal_cost",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
+                standing_loss = _require_row_or_technology_attribute(
+                    row,
+                    "standing_loss",
+                    costs_df,
+                    "uhs_storage",
+                    "standing_loss",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                )
 
-                linked_min = installed_energy_mwh
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.stores.index:
-                    prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_mwh)
-                    linked_min = max(installed_energy_mwh, prev_energy)
-
-                n.add(
-                    "Store",
-                    asset_id,
+                _add_h2_store_from_row(
+                    row=row,
+                    asset_type=asset_type,
+                    asset_id=asset_id,
                     bus=uhs_bus_id,
                     carrier="uhs_storage",
-                    e_nom=float(installed_energy_mwh),
-                    e_nom_min=float(linked_min),
-                    e_nom_extendable=expansion_allowed,
-                    e_nom_max=float(installed_energy_mwh) if not expansion_allowed else np.nan,
+                    installed_energy_mwh=installed_energy_mwh,
                     standing_loss=standing_loss,
                     capital_cost=capital_cost,
                     marginal_cost=marginal_cost,
+                    expansion_allowed=expansion_allowed,
                 )
 
-                if expansion_allowed and previous_year_network is not None and asset_id in previous_year_network.stores.index:
-                    prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_mwh)
-                    if prev_energy > 0:
-                        n.stores.loc[asset_id, "e_nom_max"] = max(installed_energy_mwh, prev_energy * 1.5)
-
             elif asset_type == "uhs":
+                # Combined UHS definition: one CSV row creates injection, withdrawal and underground store.
                 uhs_bus_id = f"uhs_{zone}"
                 if uhs_bus_id not in n.buses.index:
                     n.add("Bus", uhs_bus_id, carrier="uhs_storage")
 
                 installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
-                injection_capacity_mw = _safe_float(
-                    row.get("injection_capacity_mw", np.nan),
-                    installed_capacity_mw,
-                )
-                withdrawal_capacity_mw = _safe_float(
-                    row.get("withdrawal_capacity_mw", np.nan),
-                    installed_capacity_mw,
-                )
+                injection_capacity_mw = _safe_float(row.get("injection_capacity_mw", np.nan), installed_capacity_mw)
+                withdrawal_capacity_mw = _safe_float(row.get("withdrawal_capacity_mw", np.nan), installed_capacity_mw)
                 installed_energy_mwh = _safe_float(row.get("installed_energy_mwh", 0.0), 0.0)
 
                 injection_efficiency = _safe_float(
                     row.get("injection_efficiency", np.nan),
-                    _safe_float(row.get("efficiency", np.nan), default_costs["uhs_injection_eff"]),
+                    _require_row_or_technology_attribute(
+                        row,
+                        "efficiency",
+                        costs_df,
+                        "uhs_injection",
+                        "efficiency",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    ),
                 )
                 withdrawal_efficiency = _safe_float(
                     row.get("withdrawal_efficiency", np.nan),
-                    _safe_float(row.get("efficiency", np.nan), default_costs["uhs_withdrawal_eff"]),
+                    _require_row_or_technology_attribute(
+                        row,
+                        "efficiency",
+                        costs_df,
+                        "uhs_withdrawal",
+                        "efficiency",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    ),
                 )
 
                 injection_capital_cost = _safe_float(
                     row.get("injection_capital_cost", np.nan),
-                    _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_injection_capital"]),
+                    _require_row_or_technology_attribute(
+                        row,
+                        "capital_cost",
+                        costs_df,
+                        "uhs_injection",
+                        "capital_cost",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    ),
                 )
                 withdrawal_capital_cost = _safe_float(
                     row.get("withdrawal_capital_cost", np.nan),
-                    _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_withdrawal_capital"]),
+                    _require_row_or_technology_attribute(
+                        row,
+                        "capital_cost",
+                        costs_df,
+                        "uhs_withdrawal",
+                        "capital_cost",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    ),
                 )
                 storage_capital_cost = _safe_float(
                     row.get("storage_capital_cost", np.nan),
-                    _safe_float(row.get("capital_cost", np.nan), default_costs["uhs_storage_capital"]),
+                    _require_row_or_technology_attribute(
+                        row,
+                        "capital_cost",
+                        costs_df,
+                        "uhs_storage",
+                        "capital_cost",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    ),
                 )
 
                 injection_marginal_cost = _safe_float(
                     row.get("injection_marginal_cost", np.nan),
-                    _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_injection_marginal"]),
+                    _require_row_or_technology_attribute(
+                        row,
+                        "marginal_cost",
+                        costs_df,
+                        "uhs_injection",
+                        "marginal_cost",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    ),
                 )
                 withdrawal_marginal_cost = _safe_float(
                     row.get("withdrawal_marginal_cost", np.nan),
-                    _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_withdrawal_marginal"]),
+                    _require_row_or_technology_attribute(
+                        row,
+                        "marginal_cost",
+                        costs_df,
+                        "uhs_withdrawal",
+                        "marginal_cost",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    ),
                 )
                 storage_marginal_cost = _safe_float(
                     row.get("storage_marginal_cost", np.nan),
-                    _safe_float(row.get("marginal_cost", np.nan), default_costs["uhs_storage_marginal"]),
+                    _require_row_or_technology_attribute(
+                        row,
+                        "marginal_cost",
+                        costs_df,
+                        "uhs_storage",
+                        "marginal_cost",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    ),
                 )
 
-                standing_loss = _safe_float(
-                    row.get("standing_loss", np.nan),
-                    default_costs["uhs_storage_standing_loss"],
+                standing_loss = _require_row_or_technology_attribute(
+                    row,
+                    "standing_loss",
+                    costs_df,
+                    "uhs_storage",
+                    "standing_loss",
+                    context=str(row.get("asset_id", row.get("asset_type", "asset"))),
                 )
-
-                injection_available_from_year = int(
-                    _safe_float(
-                        row.get("injection_available_from_year", np.nan),
-                        _safe_float(row.get("available_from_year", model_year), model_year),
-                    )
-                )
-                withdrawal_available_from_year = int(
-                    _safe_float(
-                        row.get("withdrawal_available_from_year", np.nan),
-                        _safe_float(row.get("available_from_year", model_year), model_year),
-                    )
-                )
-                store_available_from_year = int(
-                    _safe_float(
-                        row.get("store_available_from_year", np.nan),
-                        _safe_float(row.get("available_from_year", model_year), model_year),
-                    )
-                )
-
-                inj_expansion_allowed = model_year >= injection_available_from_year
-                wdr_expansion_allowed = model_year >= withdrawal_available_from_year
-                store_expansion_allowed = model_year >= store_available_from_year
 
                 continuous_op = int(_safe_float(row.get("continuous_operation", 0), 0))
                 inj_season_start = _safe_float(row.get("injection_season_start", np.nan), np.nan)
@@ -2014,85 +3468,442 @@ def build_case_network(
                     if not pd.isna(wdr_season_start) and not pd.isna(wdr_season_days):
                         wdr_p_max_pu = _build_seasonal_mask(snapshots, int(wdr_season_start), int(wdr_season_days))
 
-                inj_id = f"uhs_injection_{zone}"
-                wdr_id = f"uhs_withdrawal_{zone}"
-                store_id = f"uhs_store_{zone}"
+                base_id = _asset_id_from_row(row, f"uhs_{zone}")
+                inj_id = f"{base_id}_injection"
+                wdr_id = f"{base_id}_withdrawal"
+                store_id = f"{base_id}_store"
 
-                inj_linked_min = injection_capacity_mw
-                if inj_expansion_allowed and previous_year_network is not None and inj_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", inj_id, injection_capacity_mw)
-                    inj_linked_min = max(injection_capacity_mw, prev_cap)
+                # Copy row for component-specific maxima if provided.
+                inj_row = row.copy()
+                if "injection_p_nom_max_mw" in row.index and pd.notna(row.get("injection_p_nom_max_mw")):
+                    inj_row["p_nom_max_mw"] = row.get("injection_p_nom_max_mw")
+                wdr_row = row.copy()
+                if "withdrawal_p_nom_max_mw" in row.index and pd.notna(row.get("withdrawal_p_nom_max_mw")):
+                    wdr_row["p_nom_max_mw"] = row.get("withdrawal_p_nom_max_mw")
 
-                inj_link_attrs = dict(
+                _add_h2_link_from_row(
+                    row=inj_row,
+                    asset_type="uhs_injection",
+                    asset_id=inj_id,
                     bus0=f"h2_{zone}",
                     bus1=uhs_bus_id,
                     carrier="uhs_injection",
-                    p_nom=injection_capacity_mw,
-                    p_nom_min=inj_linked_min,
-                    p_nom_extendable=inj_expansion_allowed,
-                    p_nom_max=injection_capacity_mw if not inj_expansion_allowed else np.nan,
+                    installed_capacity_mw=injection_capacity_mw,
                     efficiency=injection_efficiency,
                     capital_cost=injection_capital_cost,
                     marginal_cost=injection_marginal_cost,
+                    expansion_allowed=expansion_allowed,
+                    p_max_pu=inj_p_max_pu,
                 )
-                if inj_p_max_pu is not None:
-                    inj_link_attrs["p_max_pu"] = inj_p_max_pu.values
-                n.add("Link", inj_id, **inj_link_attrs)
-
-                if inj_expansion_allowed and previous_year_network is not None and inj_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", inj_id, injection_capacity_mw)
-                    if prev_cap > 0:
-                        n.links.loc[inj_id, "p_nom_max"] = max(injection_capacity_mw, prev_cap * 1.5)
-
-                wdr_linked_min = withdrawal_capacity_mw
-                if wdr_expansion_allowed and previous_year_network is not None and wdr_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", wdr_id, withdrawal_capacity_mw)
-                    wdr_linked_min = max(withdrawal_capacity_mw, prev_cap)
-
-                wdr_link_attrs = dict(
+                _add_h2_link_from_row(
+                    row=wdr_row,
+                    asset_type="uhs_withdrawal",
+                    asset_id=wdr_id,
                     bus0=uhs_bus_id,
                     bus1=f"h2_{zone}",
                     carrier="uhs_withdrawal",
-                    p_nom=float(withdrawal_capacity_mw),
-                    p_nom_min=float(wdr_linked_min),
-                    p_nom_extendable=wdr_expansion_allowed,
-                    p_nom_max=float(withdrawal_capacity_mw) if not wdr_expansion_allowed else np.nan,
+                    installed_capacity_mw=withdrawal_capacity_mw,
                     efficiency=withdrawal_efficiency,
                     capital_cost=withdrawal_capital_cost,
                     marginal_cost=withdrawal_marginal_cost,
+                    expansion_allowed=expansion_allowed,
+                    p_max_pu=wdr_p_max_pu,
                 )
-                if wdr_p_max_pu is not None:
-                    wdr_link_attrs["p_max_pu"] = wdr_p_max_pu.values
-                n.add("Link", wdr_id, **wdr_link_attrs)
-
-                if wdr_expansion_allowed and previous_year_network is not None and wdr_id in previous_year_network.links.index:
-                    prev_cap = _previous_nominal_capacity(previous_year_network, "links", wdr_id, withdrawal_capacity_mw)
-                    if prev_cap > 0:
-                        n.links.loc[wdr_id, "p_nom_max"] = float(max(withdrawal_capacity_mw, prev_cap * 1.5))
-
-                store_linked_min = installed_energy_mwh
-                if store_expansion_allowed and previous_year_network is not None and store_id in previous_year_network.stores.index:
-                    prev_energy = _previous_store_energy_capacity(previous_year_network, store_id, installed_energy_mwh)
-                    store_linked_min = max(installed_energy_mwh, prev_energy)
-
-                n.add(
-                    "Store",
-                    store_id,
+                _add_h2_store_from_row(
+                    row=row,
+                    asset_type="uhs_store",
+                    asset_id=store_id,
                     bus=uhs_bus_id,
                     carrier="uhs_storage",
-                    e_nom=float(installed_energy_mwh),
-                    e_nom_min=float(store_linked_min),
-                    e_nom_extendable=store_expansion_allowed,
-                    e_nom_max=float(installed_energy_mwh) if not store_expansion_allowed else np.nan,
+                    installed_energy_mwh=installed_energy_mwh,
                     standing_loss=standing_loss,
                     capital_cost=storage_capital_cost,
                     marginal_cost=storage_marginal_cost,
+                    expansion_allowed=expansion_allowed,
                 )
 
-                if store_expansion_allowed and previous_year_network is not None and store_id in previous_year_network.stores.index:
-                    prev_energy = _previous_store_energy_capacity(previous_year_network, store_id, installed_energy_mwh)
-                    if prev_energy > 0:
-                        n.stores.loc[store_id, "e_nom_max"] = float(max(installed_energy_mwh, prev_energy * 1.5))
+    if enable_ptx and enable_hydrogen:
+        if ptx_assets_df is None:
+            ptx_assets_df = pd.DataFrame()
+        if ptx_monthly_demand_df is None:
+            ptx_monthly_demand_df = pd.DataFrame()
+
+        ptx_asset_alias = {
+            "air_separation": "asu",
+            "air_separation_unit": "asu",
+            "n2_production": "asu",
+            "direct_air_capture": "dac",
+            "co2_capture": "dac",
+            "nh3_synthesis": "ammonia_synthesis",
+            "haber_bosch": "ammonia_synthesis",
+            "ch3oh_synthesis": "methanol_synthesis",
+            "meoh_synthesis": "methanol_synthesis",
+            "nh3_store": "ammonia_store",
+            "ch3oh_store": "methanol_store",
+            "meoh_store": "methanol_store",
+        }
+
+        def _ensure_bus(bus_id: str, carrier: str) -> None:
+            if bus_id not in n.buses.index:
+                n.add("Bus", bus_id, carrier=carrier)
+
+        def _ptx_link_capacity(row: pd.Series, asset_id: str, expansion_allowed: bool) -> tuple[float, float, float]:
+            installed_capacity_mw = _safe_float(row.get("installed_capacity_mw", 0.0), 0.0)
+            linked_min = installed_capacity_mw
+            if (
+                expansion_allowed
+                and previous_year_network is not None
+                and asset_id in previous_year_network.links.index
+            ):
+                prev_cap = _previous_nominal_capacity(previous_year_network, "links", asset_id, installed_capacity_mw)
+                linked_min = max(installed_capacity_mw, prev_cap)
+            if expansion_allowed:
+                explicit_upper = _optional_upper_bound(
+                    row,
+                    ["p_nom_max_mw", "max_capacity_mw", "installed_capacity_max_mw"],
+                )
+                p_nom = linked_min
+                p_nom_max = _upper_bound_or_nan(linked_min, explicit_upper)
+            else:
+                p_nom = linked_min
+                p_nom_max = linked_min
+            return float(p_nom), float(linked_min), float(p_nom_max)
+
+        def _add_ptx_link(
+            row: pd.Series,
+            asset_id: str,
+            bus0: str,
+            bus1: str,
+            carrier: str,
+            efficiency: float,
+            capital_cost: float,
+            marginal_cost: float,
+            expansion_allowed: bool,
+            bus2: Optional[str] = None,
+            efficiency2: Optional[float] = None,
+        ) -> None:
+            p_nom, p_nom_min, p_nom_max = _ptx_link_capacity(row, asset_id, expansion_allowed)
+            attrs = dict(
+                bus0=bus0,
+                bus1=bus1,
+                carrier=carrier,
+                p_nom=p_nom,
+                p_nom_min=p_nom_min,
+                p_nom_extendable=bool(expansion_allowed),
+                efficiency=float(efficiency),
+                capital_cost=float(capital_cost),
+                marginal_cost=float(marginal_cost),
+            )
+            if np.isfinite(p_nom_max):
+                attrs["p_nom_max"] = float(p_nom_max)
+            if bus2 is not None and efficiency2 is not None:
+                attrs["bus2"] = bus2
+                attrs["efficiency2"] = float(efficiency2)
+            n.add("Link", asset_id, **attrs)
+            n.links.loc[asset_id, "source_asset_type"] = str(row.get("asset_type", "ptx"))
+
+        def _add_ptx_store(
+            row: pd.Series,
+            asset_id: str,
+            bus: str,
+            carrier: str,
+            capital_cost: float,
+            marginal_cost: float,
+            standing_loss: float,
+            expansion_allowed: bool,
+        ) -> None:
+            installed_energy_tons = _safe_float(
+                row.get("installed_energy_tons", row.get("installed_energy_mwh", 0.0)),
+                0.0,
+            )
+            linked_min = installed_energy_tons
+            if (
+                expansion_allowed
+                and previous_year_network is not None
+                and asset_id in previous_year_network.stores.index
+            ):
+                prev_energy = _previous_store_energy_capacity(previous_year_network, asset_id, installed_energy_tons)
+                linked_min = max(installed_energy_tons, prev_energy)
+            if expansion_allowed:
+                explicit_upper = _optional_upper_bound(
+                    row,
+                    [
+                        "e_nom_max_tons",
+                        "max_energy_tons",
+                        "installed_energy_max_tons",
+                        "e_nom_max_mwh",
+                        "max_energy_mwh",
+                    ],
+                )
+                e_nom = linked_min
+                e_nom_max = _upper_bound_or_nan(linked_min, explicit_upper)
+            else:
+                e_nom = linked_min
+                e_nom_max = linked_min
+            attrs = dict(
+                bus=bus,
+                carrier=carrier,
+                e_nom=float(e_nom),
+                e_nom_min=float(linked_min),
+                e_nom_extendable=bool(expansion_allowed),
+                standing_loss=float(standing_loss),
+                capital_cost=float(capital_cost),
+                marginal_cost=float(marginal_cost),
+            )
+            if np.isfinite(e_nom_max):
+                attrs["e_nom_max"] = float(e_nom_max)
+            n.add("Store", asset_id, **attrs)
+            n.stores.loc[asset_id, "source_asset_type"] = str(row.get("asset_type", "ptx_store"))
+
+        # Add PtX assets: feedstock production, synthesis and product storage.
+        if ptx_assets_df is not None and not ptx_assets_df.empty:
+            for _, row in ptx_assets_df.iterrows():
+                zone = str(row["zone"]).strip()
+                if zone not in zone_set:
+                    continue
+
+                raw_asset_type = str(row["asset_type"]).strip().lower()
+                asset_type = ptx_asset_alias.get(raw_asset_type, raw_asset_type)
+                is_available, expansion_allowed, commissioning_status, commissioning_year = (
+                    _resolve_generator_commissioning(row, model_year)
+                )
+                if not is_available:
+                    continue
+
+                _ensure_bus(f"h2_{zone}", "hydrogen")
+
+                if asset_type == "asu":
+                    asset_id = _ptx_asset_id(row, asset_type, zone)
+                    _ensure_bus(f"n2_{zone}", "nitrogen")
+                    efficiency = _ptx_conversion_efficiency_from_row(
+                        row,
+                        efficiency_col="efficiency",
+                        inverse_col="electricity_mwh_per_t",
+                    )
+                    capital_cost = _require_row_or_technology_attribute(
+                        row,
+                        "capital_cost",
+                        costs_df,
+                        "asu",
+                        "capital_cost",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    )
+                    marginal_cost = _require_row_or_technology_attribute(
+                        row,
+                        "marginal_cost",
+                        costs_df,
+                        "asu",
+                        "marginal_cost",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    )
+                    _add_ptx_link(
+                        row=row,
+                        asset_id=asset_id,
+                        bus0=f"elec_{zone}",
+                        bus1=f"n2_{zone}",
+                        carrier="asu",
+                        efficiency=efficiency,
+                        capital_cost=capital_cost,
+                        marginal_cost=marginal_cost,
+                        expansion_allowed=expansion_allowed,
+                    )
+
+                elif asset_type == "dac":
+                    asset_id = _ptx_asset_id(row, asset_type, zone)
+                    _ensure_bus(f"co2_{zone}", "co2")
+                    efficiency = _ptx_conversion_efficiency_from_row(
+                        row,
+                        efficiency_col="efficiency",
+                        inverse_col="electricity_mwh_per_t",
+                    )
+                    capital_cost = _require_row_or_technology_attribute(
+                        row,
+                        "capital_cost",
+                        costs_df,
+                        "dac",
+                        "capital_cost",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    )
+                    marginal_cost = _require_row_or_technology_attribute(
+                        row,
+                        "marginal_cost",
+                        costs_df,
+                        "dac",
+                        "marginal_cost",
+                        context=str(row.get("asset_id", row.get("asset_type", "asset"))),
+                    )
+                    _add_ptx_link(
+                        row=row,
+                        asset_id=asset_id,
+                        bus0=f"elec_{zone}",
+                        bus1=f"co2_{zone}",
+                        carrier="dac",
+                        efficiency=efficiency,
+                        capital_cost=capital_cost,
+                        marginal_cost=marginal_cost,
+                        expansion_allowed=expansion_allowed,
+                    )
+
+                elif asset_type in {"ammonia_synthesis", "methanol_synthesis"}:
+                    product = _ptx_asset_product_from_row(row, asset_type)
+                    if product not in PTX_PRODUCT_DEFAULTS:
+                        raise ValueError(f"Unsupported PtX synthesis product: {product} in row {row.to_dict()}")
+                    info = PTX_PRODUCT_DEFAULTS[product]
+                    asset_id = _ptx_asset_id(row, asset_type, zone, product=product)
+                    product_bus = f"{info['bus_prefix']}_{zone}"
+                    feedstock_bus = f"{info['feedstock_bus_prefix']}_{zone}"
+                    _ensure_bus(product_bus, info["carrier"])
+                    _ensure_bus(feedstock_bus, info["feedstock"])
+                    h2_mwh_per_t = _safe_float(
+                        row.get("h2_mwh_per_t_product", row.get("h2_mwh_per_t", np.nan)),
+                        info["h2_mwh_per_t_product"],
+                    )
+                    product_efficiency = _ptx_conversion_efficiency_from_row(
+                        row,
+                        efficiency_col="efficiency",
+                        inverse_col="h2_mwh_per_t_product",
+                        default_inverse=h2_mwh_per_t,
+                    )
+                    feedstock_t_per_t = _safe_float(
+                        row.get("feedstock_t_per_t_product", np.nan),
+                        info["feedstock_t_per_t_product"],
+                    )
+                    feedstock_efficiency = -feedstock_t_per_t * product_efficiency
+                    capital_cost = _require_row_or_technology_attribute(
+                        row, "capital_cost", costs_df, info["synthesis_carrier"], "capital_cost", context=asset_id
+                    )
+                    marginal_cost = _require_row_or_technology_attribute(
+                        row, "marginal_cost", costs_df, info["synthesis_carrier"], "marginal_cost", context=asset_id
+                    )
+                    _add_ptx_link(
+                        row=row,
+                        asset_id=asset_id,
+                        bus0=f"h2_{zone}",
+                        bus1=product_bus,
+                        bus2=feedstock_bus,
+                        carrier=info["synthesis_carrier"],
+                        efficiency=product_efficiency,
+                        efficiency2=feedstock_efficiency,
+                        capital_cost=capital_cost,
+                        marginal_cost=marginal_cost,
+                        expansion_allowed=expansion_allowed,
+                    )
+
+                elif asset_type in {"ammonia_store", "methanol_store"}:
+                    product = _ptx_asset_product_from_row(row, asset_type)
+                    if product not in PTX_PRODUCT_DEFAULTS:
+                        raise ValueError(f"Unsupported PtX storage product: {product} in row {row.to_dict()}")
+                    info = PTX_PRODUCT_DEFAULTS[product]
+                    asset_id = _ptx_asset_id(row, asset_type, zone, product=product)
+                    product_bus = f"{info['bus_prefix']}_{zone}"
+                    _ensure_bus(product_bus, info["carrier"])
+                    capital_cost = _require_row_or_technology_attribute(
+                        row, "capital_cost", costs_df, info["storage_carrier"], "capital_cost", context=asset_id
+                    )
+                    marginal_cost = _require_row_or_technology_attribute(
+                        row, "marginal_cost", costs_df, info["storage_carrier"], "marginal_cost", context=asset_id
+                    )
+                    standing_loss = _require_row_or_technology_attribute(
+                        row, "standing_loss", costs_df, info["storage_carrier"], "standing_loss", context=asset_id
+                    )
+                    _add_ptx_store(
+                        row=row,
+                        asset_id=asset_id,
+                        bus=product_bus,
+                        carrier=info["storage_carrier"],
+                        capital_cost=capital_cost,
+                        marginal_cost=marginal_cost,
+                        standing_loss=standing_loss,
+                        expansion_allowed=expansion_allowed,
+                    )
+
+        # Add monthly product export constraints. Export Links consume product from the
+        # product bus. A monthly equality constraint forces total exported tonnes.
+        monthly_requirements = []
+        if ptx_monthly_demand_df is not None and not ptx_monthly_demand_df.empty:
+            demand_df = ptx_monthly_demand_df.copy()
+            if "year" in demand_df.columns:
+                demand_df = demand_df[demand_df["year"].isna() | (demand_df["year"].astype("Int64") == model_year)]
+            demand_df = demand_df[demand_df["demand_tons"] > 0].copy()
+
+            if not demand_df.empty:
+                grouped = demand_df.groupby(["zone", "product", "month"], as_index=False).agg(
+                    demand_tons=("demand_tons", "sum"),
+                    export_flexibility_factor=("export_flexibility_factor", "max"),
+                )
+                for (zone, product), product_rows in grouped.groupby(["zone", "product"]):
+                    zone = str(zone).strip()
+                    product = _ptx_product_key(product, default="")
+                    if zone not in zone_set or product not in PTX_PRODUCT_DEFAULTS:
+                        continue
+                    info = PTX_PRODUCT_DEFAULTS[product]
+                    product_bus = f"{info['bus_prefix']}_{zone}"
+                    _ensure_bus(product_bus, info["carrier"])
+                    export_id = f"{info['export_carrier']}_{zone}"
+
+                    max_hourly_export = 0.0
+                    for _, req in product_rows.iterrows():
+                        month = int(req["month"])
+                        month_hours = int((snapshots.month == month).sum())
+                        if month_hours <= 0:
+                            continue
+                        avg_rate = float(req["demand_tons"]) / month_hours
+                        flex_factor = max(1.0, float(req.get("export_flexibility_factor", 1.0)))
+                        max_hourly_export = max(max_hourly_export, avg_rate * flex_factor)
+                        monthly_requirements.append(
+                            {
+                                "link_id": export_id,
+                                "zone": zone,
+                                "product": product,
+                                "month": month,
+                                "demand_tons": float(req["demand_tons"]),
+                            }
+                        )
+
+                    if export_id not in n.links.index:
+                        n.add(
+                            "Link",
+                            export_id,
+                            bus0=product_bus,
+                            bus1=product_bus,
+                            carrier=info["export_carrier"],
+                            p_nom=float(max_hourly_export),
+                            p_nom_extendable=False,
+                            efficiency=0.0,
+                            capital_cost=0.0,
+                            marginal_cost=0.0,
+                        )
+        # Optional diagnostic slack for PtX product shortfall.
+        # This creates expensive fictitious product supply at the product bus.
+        # It should be zero in final feasible scenarios.
+        if enable_ptx_shortfall_slack and monthly_requirements:
+            required_product_zones = sorted(
+                {
+                    (str(req["zone"]).strip(), _ptx_product_key(req["product"], default=""))
+                    for req in monthly_requirements
+                }
+            )
+
+            for zone, product in required_product_zones:
+                if zone not in zone_set or product not in PTX_PRODUCT_DEFAULTS:
+                    continue
+
+                info = PTX_PRODUCT_DEFAULTS[product]
+                product_bus = f"{info['bus_prefix']}_{zone}"
+                _ensure_bus(product_bus, info["carrier"])
+
+                slack_id = f"ptx_shortfall_{product}_{zone}"
+
+                if slack_id not in n.generators.index:
+                    n.add(
+                        "Generator",
+                        slack_id,
+                        bus=product_bus,
+                        carrier="ptx_shortfall",
+                        p_nom=1e9,  # effectively unlimited, in t product/h
+                        marginal_cost=float(ptx_shortfall_cost_per_ton),
+                    )
+        n._ptx_monthly_export_requirements = monthly_requirements
 
     if co2_cap_tons is not None:
         n.add(
@@ -2105,6 +3916,329 @@ def build_case_network(
         )
 
     return n
+
+
+def _select_linopy_by_labels(var, component: str, labels: list[str]):
+    """Select a linopy variable by component labels with PyPSA-version tolerance."""
+    labels = [str(label) for label in labels]
+    preferred_dims = [component, f"{component}-ext", f"{component}-fix"]
+
+    for dim in preferred_dims:
+        if dim in getattr(var, "dims", []):
+            return var.loc[{dim: labels}], dim
+
+    for dim in getattr(var, "dims", []):
+        try:
+            coord_values = pd.Index(var.coords[dim].values.astype(str))
+            if set(labels).issubset(set(coord_values)):
+                return var.loc[{dim: labels}], dim
+        except Exception:
+            continue
+
+    if not getattr(var, "dims", []):
+        raise ValueError(f"Cannot select labels from scalar linopy variable for {component}.")
+
+    dim = list(var.dims)[-1]
+    return var.loc[{dim: labels}], dim
+
+
+def _rename_linopy_dim(obj, old_dim: str, new_dim: str):
+    """Rename linopy/xarray dimensions when needed for expression alignment."""
+    if old_dim == new_dim:
+        return obj
+    try:
+        return obj.rename({old_dim: new_dim})
+    except Exception:
+        return obj
+
+
+def _safe_model_name(value: str) -> str:
+    """Return a solver-safe suffix for custom variable/constraint names."""
+    text = str(value)
+    out = []
+    for ch in text:
+        if ch.isalnum() or ch == "_":
+            out.append(ch)
+        else:
+            out.append("_")
+    safe = "".join(out).strip("_")
+    return safe or "item"
+
+
+def _select_single_linopy_label(var, component: str, label: str):
+    """Select one labelled element from a PyPSA/Linopy variable robustly."""
+    selected, dim = _select_linopy_by_labels(var, component, [str(label)])
+    if dim in getattr(selected, "dims", []):
+        try:
+            return selected.isel({dim: 0})
+        except Exception:
+            pass
+    try:
+        return selected.squeeze()
+    except Exception:
+        return selected
+
+
+def add_discrete_transmission_constraints(n, snapshots) -> None:
+    """
+    Enforce modular transmission expansion for selected Links.
+
+    For each master link with discrete_expansion=True:
+        p_nom = existing_capacity_mw + module_capacity_mw * n_modules
+
+    n_modules is an integer scalar variable per corridor. This loop-based
+    formulation avoids xarray/Linopy dimension issues when there is only one
+    candidate transmission corridor.
+    """
+    if n.links.empty or "discrete_expansion" not in n.links.columns:
+        return
+
+    discrete_links = (
+        n.links.index[
+            n.links["discrete_expansion"].fillna(False).astype(bool)
+            & n.links["p_nom_extendable"].fillna(False).astype(bool)
+        ]
+        .astype(str)
+        .tolist()
+    )
+
+    if not discrete_links:
+        return
+
+    m = n.model
+    try:
+        link_p_nom = m.variables["Link-p_nom"]
+    except Exception:
+        return
+
+    for link_id in discrete_links:
+        min_modules = float(n.links.loc[link_id, "min_modules"])
+        max_modules = float(n.links.loc[link_id, "max_modules"])
+        existing = float(n.links.loc[link_id, "existing_capacity_mw"])
+        module_size = float(n.links.loc[link_id, "module_capacity_mw"])
+
+        if not np.isfinite(module_size) or module_size <= 0:
+            raise ValueError(f"Discrete transmission link {link_id} requires module_capacity_mw > 0.")
+        if not np.isfinite(max_modules) or max_modules < min_modules:
+            raise ValueError(
+                f"Discrete transmission link {link_id} has invalid min/max modules: "
+                f"min_modules={min_modules}, max_modules={max_modules}."
+            )
+
+        safe_id = _safe_model_name(link_id)
+        n_modules = m.add_variables(
+            lower=min_modules,
+            upper=max_modules,
+            integer=True,
+            name=f"Link_n_modules_{safe_id}",
+        )
+
+        link_capacity = _select_single_linopy_label(link_p_nom, "Link", link_id)
+        m.add_constraints(
+            link_capacity == existing + module_size * n_modules,
+            name=f"Link_discrete_module_capacity_{safe_id}",
+        )
+
+
+def add_bidirectional_link_capacity_constraints(n, snapshots) -> None:
+    """Force reverse-direction Links to share the master corridor capacity.
+
+    Bidirectional corridors are implemented as two non-negative directed links:
+    master_fwd and master_rev. This constraint enforces:
+        p_nom(master_rev) = p_nom(master_fwd)
+    so investment is made in one physical corridor, while flows remain non-negative
+    in each direction and cannot create artificial negative objective terms.
+    """
+    if n.links.empty or "shared_capacity_with" not in n.links.columns:
+        return
+
+    shared_rows = n.links[
+        n.links["shared_capacity_with"].notna() & n.links["p_nom_extendable"].fillna(False).astype(bool)
+    ].copy()
+
+    m = n.model
+    try:
+        link_p_nom = m.variables["Link-p_nom"]
+    except Exception:
+        return
+
+    for reverse_id, row in shared_rows.iterrows():
+        reverse_id = str(reverse_id)
+        master_id = str(row["shared_capacity_with"])
+        if master_id not in n.links.index:
+            continue
+
+        if not bool(n.links.loc[master_id, "p_nom_extendable"]):
+            continue
+
+        safe_id = _safe_model_name(f"{reverse_id}_shares_{master_id}")
+        reverse_capacity = _select_single_linopy_label(link_p_nom, "Link", reverse_id)
+        master_capacity = _select_single_linopy_label(link_p_nom, "Link", master_id)
+        m.add_constraints(
+            reverse_capacity == master_capacity,
+            name=f"Link_bidirectional_shared_capacity_{safe_id}",
+        )
+
+
+def add_ptx_monthly_export_constraints(n, snapshots) -> None:
+    """Force monthly PtX product exports to match ptx_monthly_demand.csv totals."""
+    requirements = getattr(n, "_ptx_monthly_export_requirements", [])
+    if not requirements:
+        return
+
+    m = n.model
+    try:
+        link_p = m.variables["Link-p"]
+    except Exception:
+        return
+
+    for req in requirements:
+        link_id = str(req["link_id"])
+        if link_id not in n.links.index:
+            continue
+        month = int(req["month"])
+        month_snapshots = snapshots[snapshots.month == month]
+        if len(month_snapshots) == 0:
+            continue
+
+        selected = link_p.loc[dict(snapshot=month_snapshots)]
+        link_flow, _ = _select_linopy_by_labels(selected, "Link", [link_id])
+        safe_id = _safe_model_name(f"{link_id}_{int(req['month'])}_{req.get('zone', '')}_{req.get('product', '')}")
+        m.add_constraints(
+            link_flow.sum() == float(req["demand_tons"]),
+            name=f"PTX_monthly_export_{safe_id}",
+        )
+
+
+def add_hydro_reservoir_soc_constraints(n, snapshots) -> None:
+    """Apply minimum, maximum and terminal SOC bounds to hydro reservoirs."""
+    if n.storage_units.empty or "source_asset_type" not in n.storage_units.columns:
+        return
+
+    reservoir_ids = (
+        n.storage_units.index[n.storage_units["source_asset_type"].astype(str).eq("hydro_reservoir")]
+        .astype(str)
+        .tolist()
+    )
+    if not reservoir_ids:
+        return
+
+    model = n.model
+    try:
+        state_of_charge = model.variables["StorageUnit-state_of_charge"]
+    except Exception:
+        return
+
+    for asset_id in reservoir_ids:
+        selected, storage_dim = _select_linopy_by_labels(
+            state_of_charge,
+            "StorageUnit",
+            [asset_id],
+        )
+        if storage_dim in getattr(selected, "dims", []):
+            selected = selected.isel({storage_dim: 0})
+
+        energy_capacity_mwh = float(n.storage_units.loc[asset_id, "hydro_energy_capacity_mwh"])
+        min_soc_pu = float(n.storage_units.loc[asset_id, "hydro_min_soc_pu"])
+        max_soc_pu = float(n.storage_units.loc[asset_id, "hydro_max_soc_pu"])
+        final_soc_pu = float(n.storage_units.loc[asset_id, "hydro_final_soc_pu"])
+        safe_id = _safe_model_name(asset_id)
+
+        model.add_constraints(
+            selected >= min_soc_pu * energy_capacity_mwh,
+            name=f"Hydro_min_soc_{safe_id}",
+        )
+        model.add_constraints(
+            selected <= max_soc_pu * energy_capacity_mwh,
+            name=f"Hydro_max_soc_{safe_id}",
+        )
+        model.add_constraints(
+            selected.loc[dict(snapshot=snapshots[-1])] == final_soc_pu * energy_capacity_mwh,
+            name=f"Hydro_final_soc_{safe_id}",
+        )
+
+
+def add_custom_constraints(n, snapshots) -> None:
+    """Attach custom model constraints before optimization."""
+    add_discrete_transmission_constraints(n, snapshots)
+    add_bidirectional_link_capacity_constraints(n, snapshots)
+    add_hydro_reservoir_soc_constraints(n, snapshots)
+    add_ptx_monthly_export_constraints(n, snapshots)
+
+
+def sanitize_optional_link_ports(n) -> None:
+    """Clean optional multi-port Link columns before optimization.
+
+    PyPSA creates columns such as bus2/efficiency2 when at least one Link
+    has a third port. Ordinary two-port Links then contain NaN in those
+    optional columns. This function only fills optional efficiencies with
+    zero when the matching optional bus is empty.
+
+    If a Link has a non-empty optional bus but a missing efficiency, that is
+    treated as an input/model error and the run stops explicitly.
+    """
+    if n.links.empty:
+        return
+
+    for port in range(2, 10):
+        bus_col = f"bus{port}"
+        eff_col = f"efficiency{port}"
+
+        if bus_col not in n.links.columns and eff_col not in n.links.columns:
+            continue
+
+        if bus_col not in n.links.columns:
+            n.links[bus_col] = ""
+
+        n.links[bus_col] = n.links[bus_col].fillna("").astype(object)
+        bus_has_value = n.links[bus_col].astype(str).str.strip().ne("")
+
+        if eff_col not in n.links.columns:
+            if bus_has_value.any():
+                bad_links = n.links.index[bus_has_value].astype(str).tolist()
+                raise ValueError(
+                    f"Links with non-empty {bus_col} require column {eff_col}. Affected links: {bad_links}"
+                )
+            n.links[eff_col] = 0.0
+            continue
+
+        eff_numeric = pd.to_numeric(n.links[eff_col], errors="coerce")
+        missing_eff = eff_numeric.isna()
+
+        bad_mask = bus_has_value & missing_eff
+        if bad_mask.any():
+            bad_links = n.links.index[bad_mask].astype(str).tolist()
+            raise ValueError(
+                f"Links with non-empty {bus_col} must have a finite {eff_col}. Affected links: {bad_links}"
+            )
+
+        # Safe case: ordinary two-port Links have empty optional bus ports.
+        # Their optional efficiencies are set to zero so PyPSA does not carry NaNs.
+        eff_numeric.loc[~bus_has_value & missing_eff] = 0.0
+        n.links[eff_col] = eff_numeric.astype(float)
+
+
+def validate_diagnostic_ptx_shortfall(network, general_settings: Optional[dict]) -> None:
+    """Fail early if PtX shortfall slack was requested but not built."""
+    if not general_settings or "ptx_shortfall_cost_per_ton" not in general_settings:
+        return
+
+    requirements = getattr(network, "_ptx_monthly_export_requirements", [])
+    if not requirements:
+        return
+
+    if network.generators.empty or "carrier" not in network.generators.columns:
+        raise RuntimeError(
+            "ptx_shortfall_cost_per_ton is enabled in general.csv, but the network "
+            "has no generators table/carrier column."
+        )
+
+    has_shortfall = network.generators["carrier"].astype(str).eq("ptx_shortfall").any()
+    if not has_shortfall:
+        raise RuntimeError(
+            "ptx_shortfall_cost_per_ton is enabled in general.csv and PtX monthly "
+            "export requirements exist, but no ptx_shortfall generator was created."
+        )
 
 
 def run_case(
@@ -2121,23 +4255,33 @@ def run_case(
     mip_gap: Optional[float] = None,
     threads: Optional[int] = None,
     prepare_cutout: bool = False,
-    fallback_to_highs: bool = True,
+    fallback_to_highs: bool = False,
     co2_cap_tons: Optional[float] = None,
     enable_hydrogen: bool = True,
     enable_heat: bool = True,
+    enable_ptx: bool = True,
     slack_cost_per_mwh: Optional[float] = None,
     demand_round_decimals: Optional[int] = None,
     nodes_df: Optional[pd.DataFrame] = None,
     capacity_df: Optional[pd.DataFrame] = None,
     storage_df: Optional[pd.DataFrame] = None,
+    hydro_assets_df: Optional[pd.DataFrame] = None,
+    hydro_inflows: Optional[pd.DataFrame] = None,
+    hydrology_year: Optional[int] = None,
     hydrogen_df: Optional[pd.DataFrame] = None,
     hydrogen_demand: Optional[pd.DataFrame] = None,
+    ptx_assets_df: Optional[pd.DataFrame] = None,
+    ptx_monthly_demand_df: Optional[pd.DataFrame] = None,
     previous_year_network=None,
     csv_nodes: str = DEFAULT_PATHS["nodes_csv"],
     csv_interlinks: str = DEFAULT_PATHS["interlinks_csv"],
     csv_capacity: str = DEFAULT_PATHS["capacity_csv"],
     csv_storage: str = DEFAULT_PATHS["storage_csv"],
+    csv_hydro_assets: str = DEFAULT_PATHS["hydro_assets_csv"],
+    csv_hydro_inflows: str = DEFAULT_PATHS["hydro_inflows_csv"],
     csv_hydrogen: str = DEFAULT_PATHS["hydrogen_csv"],
+    csv_ptx_assets: str = DEFAULT_PATHS["ptx_assets_csv"],
+    csv_ptx_monthly_demand: str = DEFAULT_PATHS["ptx_monthly_demand_csv"],
     csv_costs: str = DEFAULT_PATHS["costs_csv"],
     csv_general: str = DEFAULT_PATHS["general_csv"],
     csv_demand: str = DEFAULT_PATHS["demand_csv"],
@@ -2150,42 +4294,65 @@ def run_case(
     if nodes_df is None:
         nodes_df = load_nodes_from_csv(csv_nodes)
     if nodes_df is None:
-        raise FileNotFoundError(
-            f"Nodes CSV not found: {csv_nodes}. Define nodes in your case input folder."
-        )
+        raise FileNotFoundError(f"Nodes CSV not found: {csv_nodes}. Define nodes in your case input folder.")
 
     if capacity_df is None:
         capacity_df = load_generator_capacity_from_csv(csv_capacity)
 
     if storage_df is None:
         storage_df = load_storage_capacity_from_csv(csv_storage)
+    if hydro_assets_df is None:
+        hydro_assets_df = load_hydro_assets_from_csv(csv_hydro_assets)
     if hydrogen_df is None and enable_hydrogen:
         hydrogen_df = load_hydrogen_assets_from_csv(csv_hydrogen)
     if not enable_hydrogen:
         hydrogen_df = None
+    if ptx_assets_df is None and enable_ptx and enable_hydrogen:
+        ptx_assets_df = load_ptx_assets_from_csv(csv_ptx_assets)
+    if ptx_monthly_demand_df is None and enable_ptx and enable_hydrogen:
+        ptx_monthly_demand_df = load_ptx_monthly_demand_from_csv(csv_ptx_monthly_demand)
+    if not (enable_ptx and enable_hydrogen):
+        ptx_assets_df = None
+        ptx_monthly_demand_df = None
 
     general_settings = load_general_settings_from_csv(csv_general)
-    effective_slack_cost = _resolve_slack_cost(slack_cost_per_mwh, general_settings, default=500.0)
+    effective_slack_cost = _resolve_slack_cost(slack_cost_per_mwh, general_settings)
 
     snapshots = build_snapshots(year=year)
+    if hydro_assets_df is not None and not hydro_assets_df.empty and hydro_inflows is None:
+        requested_hydrology_year = (
+            int(hydrology_year)
+            if hydrology_year is not None
+            else _requested_hydrology_year(general_settings, int(year))
+        )
+        hydro_inflows, hydrology_year = load_hydro_inflows_from_csv(
+            snapshots=snapshots,
+            csv_path=csv_hydro_inflows,
+            hydrology_year=requested_hydrology_year,
+        )
+        print(f"Using hydro inflow year: {hydrology_year}")
+    resolved_csv_demand = _resolve_demand_csv_path(csv_demand, csv_nodes)
+    resolved_csv_demand_summary = _resolve_demand_summary_csv_path(
+        csv_demand_summary,
+        resolved_csv_demand,
+    )
     demand_by_type, demand_summary = build_demands(
         snapshots=snapshots,
         nodes_df=nodes_df,
         csv_nodes=csv_nodes,
-        demand_csv=csv_demand,
-        fallback_to_synthetic=True,
-        summary_output_csv=csv_demand_summary,
+        demand_csv=resolved_csv_demand,
+        fallback_to_synthetic=False,
+        summary_output_csv=resolved_csv_demand_summary,
         demand_round_decimals=demand_round_decimals,
     )
-    _warn_if_synthetic_demand(demand_summary, case_name=case_name, csv_demand=csv_demand)
+    _warn_if_synthetic_demand(demand_summary, case_name=case_name, csv_demand=resolved_csv_demand)
     load = demand_by_type.get("electricity", pd.DataFrame(index=snapshots))
     heat_load = demand_by_type.get("heat", pd.DataFrame(index=snapshots))
     zone_columns = nodes_df["zone"].astype(str).tolist()
     missing_electricity_zones = [zone for zone in zone_columns if zone not in load.columns]
     if missing_electricity_zones:
         print(
-            "Warning: electricity demand is missing zones "
-            f"{missing_electricity_zones}; filling them with zero demand."
+            f"Warning: electricity demand is missing zones {missing_electricity_zones}; filling them with zero demand."
         )
         load = load.reindex(columns=zone_columns, fill_value=0.0)
     else:
@@ -2194,10 +4361,7 @@ def run_case(
     if heat_load is not None:
         missing_heat_zones = [zone for zone in zone_columns if zone not in heat_load.columns]
         if missing_heat_zones:
-            print(
-                "Warning: heat demand is missing zones "
-                f"{missing_heat_zones}; filling them with zero demand."
-            )
+            print(f"Warning: heat demand is missing zones {missing_heat_zones}; filling them with zero demand.")
         heat_load = heat_load.reindex(columns=zone_columns, fill_value=0.0)
     if not enable_heat:
         heat_load = None
@@ -2231,19 +4395,29 @@ def run_case(
         interlinks=None,
         capacity_df=capacity_df,
         storage_df=storage_df,
+        hydro_assets_df=hydro_assets_df,
+        hydro_inflows=hydro_inflows,
+        hydrology_year=hydrology_year,
         hydrogen_df=hydrogen_df,
         hydrogen_demand=hydrogen_demand,
+        ptx_assets_df=ptx_assets_df,
+        ptx_monthly_demand_df=ptx_monthly_demand_df,
         vre_profiles={"wind": wind_cf, "solar": solar_cf},
         year=year,
         previous_year_network=previous_year_network,
         co2_cap_tons=co2_cap_tons,
         general_settings=general_settings,
         enable_hydrogen=enable_hydrogen,
+        enable_ptx=enable_ptx,
         slack_cost_per_mwh=effective_slack_cost,
         csv_interlinks=csv_interlinks,
         csv_capacity=csv_capacity,
         csv_storage=csv_storage,
+        csv_hydro_assets=csv_hydro_assets,
+        csv_hydro_inflows=csv_hydro_inflows,
         csv_hydrogen=csv_hydrogen,
+        csv_ptx_assets=csv_ptx_assets,
+        csv_ptx_monthly_demand=csv_ptx_monthly_demand,
         csv_costs=csv_costs,
     )
 
@@ -2274,19 +4448,30 @@ def run_case(
     # pandas 3.0+ uses ArrowStringArray for string columns by default,
     # which xarray cannot index. Convert all string columns to object dtype.
     for comp_df in [
-        network.buses, network.generators, network.loads, network.lines,
-        network.links, network.storage_units, network.stores,
+        network.buses,
+        network.generators,
+        network.loads,
+        network.lines,
+        network.links,
+        network.storage_units,
+        network.stores,
     ]:
         for col in comp_df.columns:
             if pd.api.types.is_string_dtype(comp_df[col]) and not comp_df[col].dtype == object:
                 comp_df[col] = comp_df[col].astype(object)
+
+    sanitize_optional_link_ports(network)
+    validate_diagnostic_ptx_shortfall(network, general_settings)
 
     try:
         primary_solver_options = _build_solver_options(solver_name, solver_options)
         optimize_kwargs = {"solver_name": solver_name}
         if primary_solver_options:
             optimize_kwargs["solver_options"] = primary_solver_options
-        status, condition = network.optimize(**optimize_kwargs)
+        status, condition = network.optimize(
+            extra_functionality=add_custom_constraints,
+            **optimize_kwargs,
+        )
     except Exception as exc:
         if fallback_to_highs and solver_name == "gurobi":
             print(f"Gurobi failed: {exc}. Using HiGHS.")
@@ -2294,12 +4479,27 @@ def run_case(
             fallback_kwargs = {"solver_name": "highs"}
             if fallback_solver_options:
                 fallback_kwargs["solver_options"] = fallback_solver_options
-            status, condition = network.optimize(**fallback_kwargs)
+            status, condition = network.optimize(
+                extra_functionality=add_custom_constraints,
+                **fallback_kwargs,
+            )
             used_solver = "highs"
         else:
             raise
 
     objective_value = float(network.objective) if network.objective is not None else np.nan
+
+    valid_conditions = {"optimal", "suboptimal"}
+    if (
+        str(status).lower() != "ok"
+        or str(condition).lower() not in valid_conditions
+        or not np.isfinite(objective_value)
+    ):
+        raise RuntimeError(
+            "Optimization did not return a valid solution. "
+            f"solver={used_solver}, status={status}, condition={condition}, "
+            f"objective={objective_value}"
+        )
 
     return {
         "year": year,
@@ -2312,6 +4512,9 @@ def run_case(
         "heat_load": heat_load,
         "wind_cf": wind_cf,
         "solar_cf": solar_cf,
+        "hydro_assets": hydro_assets_df,
+        "hydro_inflows": hydro_inflows,
+        "hydrology_year": hydrology_year,
         "cutout_path": str(cutout.path),
         "status": status,
         "condition": condition,
@@ -2319,6 +4522,7 @@ def run_case(
         "solver": used_solver,
         "co2_cap_tons": co2_cap_tons,
         "enable_hydrogen": enable_hydrogen,
+        "enable_ptx": enable_ptx,
         "slack_cost_per_mwh": effective_slack_cost,
         "vre_profile_method": vre_profile_method,
         "demand_summary": demand_summary,
@@ -2340,19 +4544,25 @@ def run_case_multiple_years(
     mip_gap: Optional[float] = None,
     threads: Optional[int] = None,
     prepare_cutout: bool = False,
-    fallback_to_highs: bool = True,
+    fallback_to_highs: bool = False,
     enable_year_linking: bool = True,
     enable_hydrogen: bool = True,
     enable_heat: bool = True,
+    enable_ptx: bool = True,
     slack_cost_per_mwh: Optional[float] = None,
     demand_round_decimals: Optional[int] = None,
     hydrogen_demand: Optional[pd.DataFrame] = None,
+    ptx_monthly_demand_df: Optional[pd.DataFrame] = None,
     co2_cap_tons=None,
     csv_nodes: str = DEFAULT_PATHS["nodes_csv"],
     csv_interlinks: str = DEFAULT_PATHS["interlinks_csv"],
     csv_capacity: str = DEFAULT_PATHS["capacity_csv"],
     csv_storage: str = DEFAULT_PATHS["storage_csv"],
+    csv_hydro_assets: str = DEFAULT_PATHS["hydro_assets_csv"],
+    csv_hydro_inflows: str = DEFAULT_PATHS["hydro_inflows_csv"],
     csv_hydrogen: str = DEFAULT_PATHS["hydrogen_csv"],
+    csv_ptx_assets: str = DEFAULT_PATHS["ptx_assets_csv"],
+    csv_ptx_monthly_demand: str = DEFAULT_PATHS["ptx_monthly_demand_csv"],
     csv_costs: str = DEFAULT_PATHS["costs_csv"],
     csv_general: str = DEFAULT_PATHS["general_csv"],
     csv_demand: str = DEFAULT_PATHS["demand_csv"],
@@ -2367,15 +4577,17 @@ def run_case_multiple_years(
 
     nodes_df = load_nodes_from_csv(csv_nodes)
     if nodes_df is None:
-        raise FileNotFoundError(
-            f"Nodes CSV not found: {csv_nodes}. Define nodes in your case input folder."
-        )
+        raise FileNotFoundError(f"Nodes CSV not found: {csv_nodes}. Define nodes in your case input folder.")
 
     capacity_df = load_generator_capacity_from_csv(csv_capacity)
     storage_df = load_storage_capacity_from_csv(csv_storage)
+    hydro_assets_df = load_hydro_assets_from_csv(csv_hydro_assets)
     hydrogen_df = load_hydrogen_assets_from_csv(csv_hydrogen) if enable_hydrogen else None
+    ptx_assets_df = load_ptx_assets_from_csv(csv_ptx_assets) if (enable_ptx and enable_hydrogen) else None
+    if ptx_monthly_demand_df is None and enable_ptx and enable_hydrogen:
+        ptx_monthly_demand_df = load_ptx_monthly_demand_from_csv(csv_ptx_monthly_demand)
     general_settings = load_general_settings_from_csv(csv_general)
-    effective_slack_cost = _resolve_slack_cost(slack_cost_per_mwh, general_settings, default=500.0)
+    effective_slack_cost = _resolve_slack_cost(slack_cost_per_mwh, general_settings)
 
     results = {}
     previous_network = None
@@ -2406,19 +4618,27 @@ def run_case_multiple_years(
             co2_cap_tons=_co2_cap_for_year(co2_cap_tons, year),
             enable_hydrogen=enable_hydrogen,
             enable_heat=enable_heat,
+            enable_ptx=enable_ptx,
             slack_cost_per_mwh=effective_slack_cost,
             demand_round_decimals=demand_round_decimals,
             nodes_df=nodes_df,
             capacity_df=capacity_df,
             storage_df=storage_df,
+            hydro_assets_df=hydro_assets_df,
             hydrogen_df=hydrogen_df,
             hydrogen_demand=hydrogen_demand,
+            ptx_assets_df=ptx_assets_df,
+            ptx_monthly_demand_df=ptx_monthly_demand_df,
             previous_year_network=previous_network if enable_year_linking else None,
             csv_nodes=csv_nodes,
             csv_interlinks=csv_interlinks,
             csv_capacity=csv_capacity,
             csv_storage=csv_storage,
+            csv_hydro_assets=csv_hydro_assets,
+            csv_hydro_inflows=csv_hydro_inflows,
             csv_hydrogen=csv_hydrogen,
+            csv_ptx_assets=csv_ptx_assets,
+            csv_ptx_monthly_demand=csv_ptx_monthly_demand,
             csv_costs=csv_costs,
             csv_general=csv_general,
             csv_demand=csv_demand,
@@ -2441,7 +4661,8 @@ def run_case_multiple_years(
 def export_results_to_csv(
     all_results: dict,
     case_name: str = "case",
-    output_base_dir: str = ".",
+    scenario_name: Optional[str] = None,
+    output_base_dir: str = "output",
 ) -> str:
     """Export multi-year optimization results to a dated output folder.
 
@@ -2476,20 +4697,39 @@ def export_results_to_csv(
     output_root.mkdir(parents=True, exist_ok=True)
 
     case_tag = str(case_name).strip()
+    if scenario_name is not None and str(scenario_name).strip():
+        case_tag = f"{case_tag}_{str(scenario_name).strip()}"
     case_tag = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in case_tag)
     case_tag = case_tag.strip("_") or "case"
 
     today = date.today().strftime("%Y_%m_%d")
     base_name = f"output_{case_tag}_{today}"
-    folder = output_root / base_name
-    counter = 2
+    counter = 1
+    folder = output_root / f"{base_name}_{counter}"
     while folder.exists():
-        folder = output_root / f"{base_name}_{counter}"
         counter += 1
+        folder = output_root / f"{base_name}_{counter}"
     folder.mkdir(parents=False, exist_ok=False)
     print(f"Exporting results to: {folder}")
 
     years = sorted(all_results.keys())
+
+    valid_conditions = {"optimal", "suboptimal"}
+    invalid_results = []
+    for year in years:
+        r = all_results[year]
+        objective = float(r.get("objective", np.nan))
+        if (
+            str(r.get("status", "")).lower() != "ok"
+            or str(r.get("condition", "")).lower() not in valid_conditions
+            or not np.isfinite(objective)
+        ):
+            invalid_results.append(
+                f"{year}: solver={r.get('solver')}, status={r.get('status')}, "
+                f"condition={r.get('condition')}, objective={r.get('objective')}"
+            )
+    if invalid_results:
+        raise RuntimeError("Refusing to export invalid optimization results:\n" + "\n".join(invalid_results))
 
     # Limit float precision so Excel does not interpret long binary-tail decimals
     # as oversized numbers and convert them unexpectedly.
@@ -2499,37 +4739,41 @@ def export_results_to_csv(
     rows = []
     for year in years:
         r = all_results[year]
-        rows.append({
-            "year": year,
-            "solver": r.get("solver", ""),
-            "status": r.get("status", ""),
-            "condition": r.get("condition", ""),
-            "objective": r.get("objective", float("nan")),
-        })
-    pd.DataFrame(rows).to_csv(
-        folder / f"{case_name}_solver_summary.csv", index=False, float_format=csv_float_format
-    )
+        rows.append(
+            {
+                "year": year,
+                "solver": r.get("solver", ""),
+                "status": r.get("status", ""),
+                "condition": r.get("condition", ""),
+                "objective": r.get("objective", float("nan")),
+            }
+        )
+    pd.DataFrame(rows).to_csv(folder / f"{case_name}_solver_summary.csv", index=False, float_format=csv_float_format)
 
     # ── 2. installed capacity by year, zone, technology ───────────────────
     cap_rows = []
     for year in years:
         net = all_results[year]["network"]
         for gen_id, row in net.generators.iterrows():
-            cap_rows.append({
-                "year": year,
-                "name": gen_id,
-                "bus": row["bus"],
-                "carrier": row["carrier"],
-                "p_nom_opt_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
-            })
+            cap_rows.append(
+                {
+                    "year": year,
+                    "name": gen_id,
+                    "bus": row["bus"],
+                    "carrier": row["carrier"],
+                    "p_nom_opt_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
+                }
+            )
         for su_id, row in net.storage_units.iterrows():
-            cap_rows.append({
-                "year": year,
-                "name": su_id,
-                "bus": row["bus"],
-                "carrier": row.get("carrier", "bess"),
-                "p_nom_opt_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
-            })
+            cap_rows.append(
+                {
+                    "year": year,
+                    "name": su_id,
+                    "bus": row["bus"],
+                    "carrier": row.get("carrier", "bess"),
+                    "p_nom_opt_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
+                }
+            )
     pd.DataFrame(cap_rows).to_csv(
         folder / f"{case_name}_capacity_by_year.csv", index=False, float_format=csv_float_format
     )
@@ -2539,16 +4783,18 @@ def export_results_to_csv(
     for year in years:
         net = all_results[year]["network"]
         for lk_id, row in net.links.iterrows():
-            link_rows.append({
-                "year": year,
-                "name": lk_id,
-                "bus0": row["bus0"],
-                "bus1": row["bus1"],
-                "carrier": row.get("carrier", ""),
-                "p_nom_mw": row.get("p_nom", 0.0),
-                "p_nom_opt_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
-                "efficiency": row.get("efficiency", 1.0),
-            })
+            link_rows.append(
+                {
+                    "year": year,
+                    "name": lk_id,
+                    "bus0": row["bus0"],
+                    "bus1": row["bus1"],
+                    "carrier": row.get("carrier", ""),
+                    "p_nom_mw": row.get("p_nom", 0.0),
+                    "p_nom_opt_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
+                    "efficiency": row.get("efficiency", 1.0),
+                }
+            )
     pd.DataFrame(link_rows).to_csv(
         folder / f"{case_name}_links_by_year.csv", index=False, float_format=csv_float_format
     )
@@ -2558,13 +4804,15 @@ def export_results_to_csv(
     for year in years:
         net = all_results[year]["network"]
         for st_id, row in net.stores.iterrows():
-            store_rows.append({
-                "year": year,
-                "name": st_id,
-                "bus": row["bus"],
-                "carrier": row.get("carrier", ""),
-                "e_nom_opt_mwh": row.get("e_nom_opt", row.get("e_nom", 0.0)),
-            })
+            store_rows.append(
+                {
+                    "year": year,
+                    "name": st_id,
+                    "bus": row["bus"],
+                    "carrier": row.get("carrier", ""),
+                    "e_nom_opt_mwh": row.get("e_nom_opt", row.get("e_nom", 0.0)),
+                }
+            )
     pd.DataFrame(store_rows).to_csv(
         folder / f"{case_name}_stores_by_year.csv", index=False, float_format=csv_float_format
     )
@@ -2578,28 +4826,43 @@ def export_results_to_csv(
             total_mwh = float(net.generators_t.p[gen_id].sum())
             carrier = net.generators.loc[gen_id, "carrier"] if gen_id in net.generators.index else ""
             bus = net.generators.loc[gen_id, "bus"] if gen_id in net.generators.index else ""
-            dispatch_rows.append({
-                "year": year, "name": gen_id, "bus": bus,
-                "carrier": carrier, "energy_mwh": total_mwh,
-            })
+            dispatch_rows.append(
+                {
+                    "year": year,
+                    "name": gen_id,
+                    "bus": bus,
+                    "carrier": carrier,
+                    "energy_mwh": total_mwh,
+                }
+            )
         # storage units (discharge positive, charge negative)
         for su_id in net.storage_units_t.p.columns:
             p = net.storage_units_t.p[su_id]
             bus = net.storage_units.loc[su_id, "bus"] if su_id in net.storage_units.index else ""
             carrier = net.storage_units.loc[su_id, "carrier"] if su_id in net.storage_units.index else "bess"
-            dispatch_rows.append({
-                "year": year, "name": su_id, "bus": bus,
-                "carrier": carrier, "energy_mwh": float(p.clip(lower=0).sum()),
-            })
+            dispatch_rows.append(
+                {
+                    "year": year,
+                    "name": su_id,
+                    "bus": bus,
+                    "carrier": carrier,
+                    "energy_mwh": float(p.clip(lower=0).sum()),
+                }
+            )
         # links (p0 = input to link)
         for lk_id in net.links_t.p0.columns:
             total_mwh = float(net.links_t.p0[lk_id].sum())
             carrier = net.links.loc[lk_id, "carrier"] if lk_id in net.links.index else ""
             bus0 = net.links.loc[lk_id, "bus0"] if lk_id in net.links.index else ""
-            dispatch_rows.append({
-                "year": year, "name": lk_id, "bus": bus0,
-                "carrier": carrier, "energy_mwh": total_mwh,
-            })
+            dispatch_rows.append(
+                {
+                    "year": year,
+                    "name": lk_id,
+                    "bus": bus0,
+                    "carrier": carrier,
+                    "energy_mwh": total_mwh,
+                }
+            )
     pd.DataFrame(dispatch_rows).to_csv(
         folder / f"{case_name}_dispatch_by_year.csv", index=False, float_format=csv_float_format
     )
@@ -2610,12 +4873,14 @@ def export_results_to_csv(
         load_df = all_results[year].get("load")
         if load_df is not None and not load_df.empty:
             for zone in load_df.columns:
-                demand_rows.append({
-                    "year": year,
-                    "zone": zone,
-                    "demand_mwh": float(load_df[zone].sum()),
-                    "peak_mw": float(load_df[zone].max()),
-                })
+                demand_rows.append(
+                    {
+                        "year": year,
+                        "zone": zone,
+                        "demand_mwh": float(load_df[zone].sum()),
+                        "peak_mw": float(load_df[zone].max()),
+                    }
+                )
     pd.DataFrame(demand_rows).to_csv(
         folder / f"{case_name}_demand_by_year.csv", index=False, float_format=csv_float_format
     )
@@ -2637,9 +4902,7 @@ def export_results_to_csv(
         net = all_results[year]["network"]
         status = str(all_results[year].get("status", "")).lower()
         carrier_factors = (
-            net.carriers["co2_emissions"]
-            if "co2_emissions" in net.carriers.columns
-            else pd.Series(dtype=float)
+            net.carriers["co2_emissions"] if "co2_emissions" in net.carriers.columns else pd.Series(dtype=float)
         )
         carrier_factors = carrier_factors.fillna(0.0)
         dispatch_p = net.generators_t.p.reindex(columns=net.generators.index, fill_value=0.0)
@@ -2652,9 +4915,7 @@ def export_results_to_csv(
             val = float(emissions_ts[cols].to_numpy().sum())
             if val != 0.0:
                 co2_rows.append({"year": year, "carrier": carrier, "co2_tons": val})
-    pd.DataFrame(co2_rows).to_csv(
-        folder / f"{case_name}_co2_by_year.csv", index=False, float_format=csv_float_format
-    )
+    pd.DataFrame(co2_rows).to_csv(folder / f"{case_name}_co2_by_year.csv", index=False, float_format=csv_float_format)
 
     print(f"  ✓ {case_name}_solver_summary.csv")
     print(f"  ✓ {case_name}_capacity_by_year.csv")
@@ -2663,22 +4924,120 @@ def export_results_to_csv(
     print(f"  ✓ {case_name}_dispatch_by_year.csv")
     print(f"  ✓ {case_name}_demand_by_year.csv")
     print(f"  ✓ link_flows/{case_name}_link_flows_<year>.csv  (per year)")
-    print(f"  ✓ {case_name}_co2_by_year.csv")
-    return str(folder)
-
-
-if __name__ == "__main__":
-    results = run_case_multiple_years(
-        years=[2030, 2040, 2050],
-        weather_year=2019,
-        case_name="example_case",
-        solver_name="gurobi",
-        prepare_cutout=False,
-        enable_year_linking=True,
+    # ── 9. PtX production/export summary by year ───────────────────────────
+    ptx_rows = []
+    ptx_carriers = {
+        "asu",
+        "dac",
+        "ammonia_synthesis",
+        "methanol_synthesis",
+        "ammonia_export",
+        "methanol_export",
+    }
+    for year in years:
+        net = all_results[year]["network"]
+        if net.links.empty or net.links_t.p0.empty:
+            continue
+        for lk_id, row in net.links.iterrows():
+            carrier = str(row.get("carrier", ""))
+            if carrier not in ptx_carriers:
+                continue
+            if lk_id not in net.links_t.p0.columns:
+                continue
+            input_total = float(net.links_t.p0[lk_id].sum())
+            efficiency = float(row.get("efficiency", 1.0)) if pd.notna(row.get("efficiency", 1.0)) else 1.0
+            output_total = input_total * efficiency
+            product = ""
+            if carrier.startswith("ammonia"):
+                product = "ammonia"
+            elif carrier.startswith("methanol"):
+                product = "methanol"
+            elif carrier == "asu":
+                product = "nitrogen"
+            elif carrier == "dac":
+                product = "co2"
+            ptx_rows.append(
+                {
+                    "year": year,
+                    "name": lk_id,
+                    "carrier": carrier,
+                    "product_or_feedstock": product,
+                    "bus0": row.get("bus0", ""),
+                    "bus1": row.get("bus1", ""),
+                    "input_total": input_total,
+                    "output_total": output_total,
+                }
+            )
+    pd.DataFrame(ptx_rows).to_csv(
+        folder / f"{case_name}_ptx_summary_by_year.csv", index=False, float_format=csv_float_format
     )
 
-    print(f"\n{'=' * 60}")
-    print("SUMMARY")
-    print(f"{'=' * 60}")
-    for year, result in results.items():
-        print(f"Year {year}: {result['objective']:,.0f} ({result['solver']})")
+    print(f"  ✓ {case_name}_ptx_summary_by_year.csv")
+    print(f"  ✓ {case_name}_co2_by_year.csv")
+
+    # ── 10. hydro reservoir operation by year ─────────────────────────────
+    hydro_rows = []
+    hydro_ts_dir = folder / "hydro_timeseries"
+    hydro_ts_dir.mkdir(parents=True, exist_ok=True)
+
+    for year in years:
+        net = all_results[year]["network"]
+        if net.storage_units.empty or "source_asset_type" not in net.storage_units.columns:
+            continue
+
+        hydro_ids = (
+            net.storage_units.index[net.storage_units["source_asset_type"].astype(str).eq("hydro_reservoir")]
+            .astype(str)
+            .tolist()
+        )
+        if not hydro_ids:
+            continue
+
+        dispatch = net.storage_units_t.p.reindex(columns=hydro_ids, fill_value=0.0)
+        soc = net.storage_units_t.state_of_charge.reindex(columns=hydro_ids, fill_value=0.0)
+        inflow = net.storage_units_t.inflow.reindex(columns=hydro_ids, fill_value=0.0)
+        spill = net.storage_units_t.spill.reindex(columns=hydro_ids, fill_value=0.0)
+
+        pd.concat(
+            {
+                "dispatch_mw": dispatch,
+                "state_of_charge_mwh": soc,
+                "inflow_mw": inflow,
+                "spill_mw": spill,
+            },
+            axis=1,
+        ).to_csv(
+            hydro_ts_dir / f"{case_name}_hydro_timeseries_{year}.csv",
+            float_format=csv_float_format,
+        )
+
+        for asset_id in hydro_ids:
+            row = net.storage_units.loc[asset_id]
+            hydro_rows.append(
+                {
+                    "year": year,
+                    "name": asset_id,
+                    "bus": row.get("bus", ""),
+                    "carrier": row.get("carrier", "hydro_storage"),
+                    "power_capacity_mw": row.get("p_nom_opt", row.get("p_nom", 0.0)),
+                    "energy_capacity_mwh": row.get(
+                        "hydro_energy_capacity_mwh",
+                        row.get("p_nom", 0.0) * row.get("max_hours", 0.0),
+                    ),
+                    "generation_mwh": float(dispatch[asset_id].clip(lower=0.0).sum()),
+                    "inflow_mwh": float(inflow[asset_id].sum()),
+                    "spill_mwh": float(spill[asset_id].sum()),
+                    "initial_soc_mwh": float(soc[asset_id].iloc[0]),
+                    "final_soc_mwh": float(soc[asset_id].iloc[-1]),
+                }
+            )
+
+    pd.DataFrame(hydro_rows).to_csv(
+        folder / f"{case_name}_hydro_summary_by_year.csv",
+        index=False,
+        float_format=csv_float_format,
+    )
+    print(f"  ✓ {case_name}_hydro_summary_by_year.csv")
+    print(f"  ✓ hydro_timeseries/{case_name}_hydro_timeseries_<year>.csv")
+
+    return str(folder)

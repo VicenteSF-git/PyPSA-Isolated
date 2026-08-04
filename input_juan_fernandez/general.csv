@@ -1,3 +1,12 @@
-parameter,value,unit,enabled
-# parameter[name],value[number/text],unit[text],enabled[bool]
-slack_cost_per_mwh,1000,USD/MWh,TRUE
+parameter,value,enabled,description,source
+slack_cost_per_mwh,100000,TRUE,Penalty for unserved electricity demand in USD/MWh,PyPSA-Isolated modelling assumption
+currency,USD,TRUE,Model reporting currency,Case convention
+currency_year,2025,TRUE,Reference currency year,Case convention
+annual_electricity_demand_mwh,1874.256,TRUE,Sum of residential public and private electricity demand reported for 2025,EEL Juan Fernandez 2026 Figure 16
+demand_reference_year,2025,TRUE,Year represented by the selected base electricity demand,EEL Juan Fernandez 2026 Figure 16
+reported_2024_electricity_demand_mwh,958.548,TRUE,Sum of the three sector values reported for 2024,EEL Juan Fernandez 2026 Figure 16
+reported_summary_electricity_mwh,967,TRUE,Electricity value printed in the total-energy summary; close to the 2024 sector total,EEL Juan Fernandez 2026 section 4.4
+reported_diesel_fuel_energy_mwh,5014,TRUE,Diesel energy attributed to electricity generation,EEL Juan Fernandez 2026 section 4.4
+existing_diesel_capacity_mw,0.88,TRUE,Two 440 kW Cummins diesel generator sets,EEL Juan Fernandez 2026 section 4.1
+network_loss_fraction,0.02,TRUE,Distribution-loss assumption used in interlinks.csv; no measured loss value was found,Planning assumption to calibrate
+h2_lhv_mwh_per_ton,33.33,TRUE,Hydrogen lower heating value used for reporting,Standard conversion

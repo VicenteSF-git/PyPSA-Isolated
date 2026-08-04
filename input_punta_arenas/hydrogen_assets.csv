@@ -1,9 +1,12 @@
-zone,asset_type,installed_capacity_mw,installed_energy_mwh,capital_cost,marginal_cost,efficiency,standing_loss,available_from_year,enabled,continuous_operation,injection_season_start,injection_season_days,withdrawal_season_start,withdrawal_season_days
-# zone[name],asset_type[name],installed_capacity_mw[MW],installed_energy_mwh[MWh],capital_cost[USD/MW],marginal_cost[USD/MWh],efficiency[fraction],standing_loss[fraction/hour],available_from_year[year],enabled[bool],continuous_operation[0/1],injection_season_start[day_of_year],injection_season_days[days],withdrawal_season_start[day_of_year],withdrawal_season_days[days]
-punta_arenas_2,electrolyzer,0,,90000,0,0.70,,2030,True,,,,,
-punta_arenas_2,h2_store_tank,,0,2500,0,,0.0005,2030,True,,,,,
-punta_arenas_2,h2_fuel_cell,0,,100000,0,0.55,,2030,True,,,,,
-punta_arenas_2,h2_turbine,0,,85000,0,0.45,,2030,True,,,,,
-punta_arenas_2,dgr_injection,0,,20000,0,0.98,,2030,True,1,274,200,152,100
-punta_arenas_2,dgr_withdrawal,0,,25000,0,0.98,,2030,True,1,274,200,152,100
-punta_arenas_2,dgr_store,,0,1200,0,,0.0001,2030,True,,,,,
+asset_id,asset_type,zone,technology,installed_capacity_mw,installed_energy_mwh,p_nom_max_mw,e_nom_max_mwh,capital_cost,marginal_cost,efficiency,standing_loss,available_from_year,earliest_commissioning_year,fixed_commissioning_year,commissioning_type,enabled,source_tech_count,continuous_operation,injection_season_start,injection_season_days,withdrawal_season_start,withdrawal_season_days
+h2_electrolyzer_cabo_negro,electrolyzer,cabo_negro,electrolyzer,0,,1000,,90000,0,0.7,,2030,2030,,flexible,TRUE,1,,,,,
+h2_surface_buffer_cabo_negro,h2_store_tank,cabo_negro,hydrogen_storage,,0,,10000,2500,0,,0.0005,2030,2030,,flexible,TRUE,1,,,,,
+h2_fuel_cell_cabo_negro,h2_fuel_cell,cabo_negro,h2_fuel_cell,0,,1000,,100000,0,0.55,,2030,2030,,flexible,TRUE,1,,,,,
+h2_turbine_cabo_negro,h2_turbine,cabo_negro,h2_turbine,0,,1000,,85000,0,0.45,,2030,2030,,flexible,TRUE,1,,,,,
+uhs_injection_cabo_negro,dgr_injection,cabo_negro,uhs_injection,0,,1000,,20000,0.01,0.98,,2030,2030,,flexible,TRUE,1,1,274,212,121,153
+uhs_withdrawal_cabo_negro,dgr_withdrawal,cabo_negro,uhs_withdrawal,0,,1000,,25000,0.01,0.98,,2030,2030,,flexible,TRUE,1,1,274,212,121,153
+uhs_store_cabo_negro,dgr_store,cabo_negro,uhs_storage,,0,,300000,1200,0,,0.0001,2030,2030,,flexible,TRUE,1,,,,,
+h2_electrolyzer_puerto_tranquilo_sur,electrolyzer,puerto_tranquilo_sur,electrolyzer,0,,1000,,90000,0,0.7,,2030,2030,,flexible,TRUE,1,,,,,
+h2_surface_buffer_puerto_tranquilo_sur,h2_store_tank,puerto_tranquilo_sur,hydrogen_storage,,0,,10000,2500,0,,0.0005,2030,2030,,flexible,TRUE,1,,,,,
+h2_fuel_cell_puerto_tranquilo_sur,h2_fuel_cell,puerto_tranquilo_sur,h2_fuel_cell,0,,1000,,100000,0,0.55,,2030,2030,,flexible,TRUE,1,,,,,
+h2_turbine_puerto_tranquilo_sur,h2_turbine,puerto_tranquilo_sur,h2_turbine,0,,1000,,85000,0,0.45,,2030,2030,,flexible,FALSE,1,,,,,

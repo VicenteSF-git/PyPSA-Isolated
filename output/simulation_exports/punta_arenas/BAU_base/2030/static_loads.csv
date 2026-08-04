@@ -1,0 +1,3 @@
+name,bus,carrier,type,p_set,q_set,sign,active
+load_punta_arenas_centro,elec_punta_arenas_centro,,,0.0,0.0,-1.0,True
+load_cabo_negro,elec_cabo_negro,,,0.0,0.0,-1.0,True

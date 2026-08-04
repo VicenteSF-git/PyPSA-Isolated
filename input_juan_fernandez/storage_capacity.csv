@@ -1,3 +1,5 @@
-zone,installed_power_mw,max_hours,capital_cost,marginal_cost,efficiency_store,efficiency_dispatch,standing_loss,available_from_year
-# zone[name],installed_power_mw[MW],max_hours[hours],capital_cost[USD/MW/yr],marginal_cost[USD/MWh],efficiency_store[fraction],efficiency_dispatch[fraction],standing_loss[fraction/hour],available_from_year[year]
-punta_arenas_2,0,4,75000,0,0.95,0.95,0.001,2030
+asset_id,storage,technology,zone,installed_power_mw,p_nom_max_mw,max_hours,capital_cost,marginal_cost,efficiency_store,efficiency_dispatch,standing_loss,available_from_year,earliest_commissioning_year,fixed_commissioning_year,commissioning_type,enabled,source_tech_count,source
+bess_2h_planta_sjb,bess_2h,bess,planta_electrica_sjb,0,1,2,55000,0,0.95,0.95,0.0001,2030,2030,,flexible,TRUE,1,Planning assumption scaled to the San Juan Bautista system
+bess_4h_planta_sjb,bess_4h,bess,planta_electrica_sjb,0,1,4,75000,0,0.95,0.95,0.0001,2030,2030,,flexible,TRUE,1,Planning assumption scaled to the San Juan Bautista system
+bess_6h_planta_sjb,bess_6h,bess,planta_electrica_sjb,0,1,6,95000,0,0.95,0.95,0.0001,2030,2030,,flexible,TRUE,1,Planning assumption scaled to the San Juan Bautista system
+bess_8h_planta_sjb,bess_8h,bess,planta_electrica_sjb,0,1,8,115000,0,0.95,0.95,0.0001,2030,2030,,flexible,TRUE,1,Planning assumption scaled to the San Juan Bautista system

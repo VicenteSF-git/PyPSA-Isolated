@@ -1,0 +1,17 @@
+scenario,year,zone,component,demand_type,annual_energy_mwh,mean_mw,max_mw,min_mw
+BAU_base,2025,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+RE_base,2025,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+RH_base,2025,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+RT_base,2025,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+BAU_base,2030,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+RE_base,2030,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+RH_base,2030,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+RT_base,2030,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+BAU_base,2040,san_juan_bautista,base_load,electricity,1879.12007484,0.21392532728142075,0.2856465,0.15651235
+RE_base,2040,san_juan_bautista,base_load,electricity,1879.12007484,0.21392532728142075,0.2856465,0.15651235
+RH_base,2040,san_juan_bautista,base_load,electricity,1879.12007484,0.21392532728142075,0.2856465,0.15651235
+RT_base,2040,san_juan_bautista,base_load,electricity,1879.12007484,0.21392532728142075,0.2856465,0.15651235
+BAU_base,2050,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+RE_base,2050,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+RH_base,2050,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235
+RT_base,2050,san_juan_bautista,base_load,electricity,1874.256,0.21395616438356166,0.2856465,0.15651235

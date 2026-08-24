@@ -1,6 +1,8 @@
 """
 Generic PyPSA configuration and optimization module.
 
+Revision: optional CSV-driven hydro reservoirs and inflow profiles.
+
 This module is case-agnostic and uses CSV inputs for nodes, generators,
 interlinks, storage, and optional technology costs.
 """
@@ -367,26 +369,21 @@ def load_interlinks_from_csv(
 def load_generator_capacity_from_csv(
     csv_path: str = DEFAULT_PATHS["capacity_csv"],
 ) -> Optional[pd.DataFrame]:
-    """
-    Load generator capacities, technology labels, costs and commissioning metadata.
+    """Load generator capacities and commissioning metadata from CSV.
 
     Required columns:
-    - generator: asset/candidate name. This is an identifier, not necessarily a technology.
-    - zone: model node/zone.
-    - installed_capacity: MW. For fixed assets this is existing/committed capacity;
-      for flexible assets this is the maximum buildable capacity in the model year.
+    - generator
+    - zone
+    - installed_capacity
 
     Recommended columns:
-    - technology: physical technology/carrier used for costs, emissions and VRE profiles
-      (e.g. solar, wind, diesel, gas, hydro). If omitted, generator is used as fallback.
-    - asset_id: optional unique PyPSA generator id. If omitted, ``generator_zone`` is used.
-    - enabled: optional TRUE/FALSE switch.
+    - technology: physical technology/carrier used for profiles and emissions.
+    - cost_key: key used to retrieve techno-economic parameters from costs.csv.
+      If omitted, technology is used as fallback.
+    - asset_id, enabled and commissioning metadata.
 
-    Optional commissioning columns:
-    - commissioning_type: fixed/existing/committed or flexible/candidate/extendable.
-    - available_from_year / earliest_commissioning_year: first year a flexible
-      candidate can be built.
-    - fixed_commissioning_year: first year a fixed/committed asset exists.
+    Cost and efficiency parameters are intentionally resolved from costs.csv,
+    not from generators_capacity.csv.
     """
     csv_file = _resolve_csv_path(csv_path)
     if not csv_file.exists():
@@ -407,6 +404,13 @@ def load_generator_capacity_from_csv(
     df["generator"] = df["generator"].astype(str).str.strip()
     df["zone"] = df["zone"].astype(str).str.strip()
     df["technology"] = df["technology"].map(_normalize_label)
+
+    if "cost_key" not in df.columns:
+        df["cost_key"] = df["technology"]
+    else:
+        missing_cost_key = df["cost_key"].isna() | (df["cost_key"].astype(str).str.strip() == "")
+        df.loc[missing_cost_key, "cost_key"] = df.loc[missing_cost_key, "technology"]
+    df["cost_key"] = df["cost_key"].map(_normalize_label)
 
     return df.reset_index(drop=True)
 
@@ -454,8 +458,15 @@ def load_storage_capacity_from_csv(
     if "storage" not in df.columns:
         df["storage"] = df["technology"]
 
+    if "cost_key" not in df.columns:
+        df["cost_key"] = df["technology"]
+    else:
+        missing_cost_key = df["cost_key"].isna() | (df["cost_key"].astype(str).str.strip() == "")
+        df.loc[missing_cost_key, "cost_key"] = df.loc[missing_cost_key, "technology"]
+
     df["zone"] = df["zone"].astype(str).str.strip()
     df["technology"] = df["technology"].map(_normalize_label)
+    df["cost_key"] = df["cost_key"].map(_normalize_label)
     df["storage"] = df["storage"].map(_normalize_label)
 
     return df.reset_index(drop=True)
@@ -637,9 +648,16 @@ def load_hydrogen_assets_from_csv(
         technology_missing = df["technology"].isna() | (df["technology"].astype(str).str.strip() == "")
         df.loc[technology_missing, "technology"] = df.loc[technology_missing, "asset_type"]
 
+    if "cost_key" not in df.columns:
+        df["cost_key"] = df["technology"]
+    else:
+        missing_cost_key = df["cost_key"].isna() | (df["cost_key"].astype(str).str.strip() == "")
+        df.loc[missing_cost_key, "cost_key"] = df.loc[missing_cost_key, "technology"]
+
     df["zone"] = df["zone"].astype(str).str.strip()
     df["asset_type"] = df["asset_type"].astype(str).str.strip().str.lower()
     df["technology"] = df["technology"].map(_normalize_label)
+    df["cost_key"] = df["cost_key"].map(_normalize_label)
 
     return df.reset_index(drop=True)
 
@@ -786,10 +804,16 @@ def load_ptx_assets_from_csv(
 
     if "product" not in df.columns:
         df["product"] = ""
+    if "cost_key" not in df.columns:
+        df["cost_key"] = df["technology"]
+    else:
+        missing_cost_key = df["cost_key"].isna() | (df["cost_key"].astype(str).str.strip() == "")
+        df.loc[missing_cost_key, "cost_key"] = df.loc[missing_cost_key, "technology"]
 
     df["zone"] = df["zone"].astype(str).str.strip()
     df["asset_type"] = df["asset_type"].astype(str).str.strip().str.lower()
     df["technology"] = df["technology"].map(_normalize_label)
+    df["cost_key"] = df["cost_key"].map(_normalize_label)
     df["product"] = df["product"].map(lambda v: _ptx_product_key(v, default=""))
 
     return df.reset_index(drop=True)
@@ -861,29 +885,24 @@ def load_ptx_monthly_demand_from_csv(
 def load_technology_costs_from_csv(
     csv_path: str = DEFAULT_PATHS["costs_csv"],
 ) -> Optional[pd.DataFrame]:
-    """
-    Load optional technology-level costs from CSV.
+    """Load technology/asset-level techno-economic parameters from CSV.
+
+    Required columns:
+    - technology
 
     Recommended columns:
-    - technology
-    - year (optional, to define year-specific rows)
-    - capital_cost
-    - marginal_cost
-    - efficiency
-    - co2_emissions
+    - cost_key: unique economic variant or plant key; defaults to technology.
+    - year / base_year
+    - capex [USD/MW]
+    - discount_rate [fraction]
+    - lifetime_years [years]
+    - fom_fraction [fraction of CAPEX per year]
+    - marginal_cost [USD/MWh]
+    - efficiency [fraction]
 
-    Optional projection columns (annual compound rate):
-    - base_year (defaults to row year if available)
-    - annual_change (applies to capital_cost and marginal_cost if specific rates are absent)
-    - capital_cost_annual_change
-    - marginal_cost_annual_change
-    - co2_emissions_annual_change
-
-    Storage-specific optional columns:
-    - max_hours
-    - efficiency_store
-    - efficiency_dispatch
-    - standing_loss
+    ``capital_cost`` [USD/MW-year] remains supported as a legacy annualized
+    override for rows whose raw CAPEX has not yet been migrated. A row should
+    not define both ``capex`` and ``capital_cost``.
     """
     csv_file = _resolve_csv_path(csv_path)
     if not csv_file.exists():
@@ -891,6 +910,15 @@ def load_technology_costs_from_csv(
 
     df = _read_csv(csv_file)
     _require_columns(df, ["technology"], csv_file)
+    df["technology"] = df["technology"].map(_normalize_label)
+
+    if "cost_key" not in df.columns:
+        df["cost_key"] = df["technology"]
+    else:
+        missing = df["cost_key"].isna() | (df["cost_key"].astype(str).str.strip() == "")
+        df.loc[missing, "cost_key"] = df.loc[missing, "technology"]
+    df["cost_key"] = df["cost_key"].map(_normalize_label)
+
     return df
 
 
@@ -934,27 +962,37 @@ def _as_bool(value, default: bool = True, *, context: str = "boolean value") -> 
 
 
 def _select_cost_rows_for_year(costs_df: pd.DataFrame, year: int) -> pd.DataFrame:
-    """Select one row per technology for the requested year.
+    """Select one row per cost_key for the requested year.
 
-    Priority per technology:
-    1) Exact match in `year`
-    2) Latest available row before target year
-    3) Earliest available row after target year
-    4) Static row without `year` value
+    Priority per cost_key:
+    1) Exact year
+    2) Latest row before target year
+    3) Earliest row after target year
+    4) Static row without year
     """
     if costs_df.empty or "technology" not in costs_df.columns:
         return costs_df
 
-    if "year" not in costs_df.columns:
-        return costs_df.copy()
-
     table = costs_df.copy()
+    if "cost_key" not in table.columns:
+        table["cost_key"] = table["technology"]
+    table["cost_key"] = table["cost_key"].map(_normalize_label)
+
+    if "year" not in table.columns:
+        duplicates = table[table["cost_key"].duplicated(keep=False)]
+        if not duplicates.empty:
+            raise ValueError(
+                "costs.csv contains duplicate static cost_key rows: "
+                f"{sorted(duplicates['cost_key'].unique().tolist())}"
+            )
+        return table.copy()
+
     table["_year_num"] = pd.to_numeric(table["year"], errors="coerce")
     out_rows = []
 
-    for technology, tech_rows in table.groupby(table["technology"].astype(str), sort=False):
-        yearly = tech_rows[tech_rows["_year_num"].notna()].copy()
-        static = tech_rows[tech_rows["_year_num"].isna()].copy()
+    for cost_key, key_rows in table.groupby("cost_key", sort=False):
+        yearly = key_rows[key_rows["_year_num"].notna()].copy()
+        static = key_rows[key_rows["_year_num"].isna()].copy()
 
         selected = None
         if not yearly.empty:
@@ -987,7 +1025,7 @@ def _select_cost_rows_for_year(costs_df: pd.DataFrame, year: int) -> pd.DataFram
 
 
 def _project_costs_for_year(costs_df: Optional[pd.DataFrame], year: Optional[int]) -> Optional[pd.DataFrame]:
-    """Resolve technology costs for model year using optional annual projection rates."""
+    """Resolve, project and annualize techno-economic costs for a model year."""
     if costs_df is None or costs_df.empty or year is None:
         return costs_df
 
@@ -997,10 +1035,15 @@ def _project_costs_for_year(costs_df: Optional[pd.DataFrame], year: Optional[int
 
     out = selected.copy()
     numeric_cols = [
-        "capital_cost",
+        "capex",
+        "discount_rate",
+        "lifetime_years",
+        "fom_fraction",
+        "capital_cost",  # legacy annualized override
         "marginal_cost",
         "co2_emissions",
         "annual_change",
+        "capex_annual_change",
         "capital_cost_annual_change",
         "marginal_cost_annual_change",
         "co2_emissions_annual_change",
@@ -1008,10 +1051,6 @@ def _project_costs_for_year(costs_df: Optional[pd.DataFrame], year: Optional[int
     for col in numeric_cols:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").astype(float)
-
-    for col in ["capital_cost", "marginal_cost", "co2_emissions"]:
-        if col in out.columns:
-            out[col] = out[col].astype(float)
 
     for idx, row in out.iterrows():
         if "base_year" in out.columns and not pd.isna(row.get("base_year")):
@@ -1024,25 +1063,56 @@ def _project_costs_for_year(costs_df: Optional[pd.DataFrame], year: Optional[int
         delta_years = int(year) - base_year
         generic_rate = _normalize_annual_rate(row.get("annual_change", np.nan))
 
-        projection_pairs = [
-            ("capital_cost", "capital_cost_annual_change"),
+        # Project raw CAPEX when available.
+        if "capex" in out.columns and not pd.isna(row.get("capex")):
+            rate = _normalize_annual_rate(row.get("capex_annual_change", np.nan))
+            if rate is None:
+                rate = generic_rate
+            if rate is not None:
+                out.at[idx, "capex"] = float(row.get("capex")) * ((1.0 + rate) ** delta_years)
+
+        # Preserve projection support for legacy annualized capital_cost rows.
+        if "capital_cost" in out.columns and not pd.isna(row.get("capital_cost")):
+            rate = _normalize_annual_rate(row.get("capital_cost_annual_change", np.nan))
+            if rate is None:
+                rate = generic_rate
+            if rate is not None:
+                out.at[idx, "capital_cost"] = float(row.get("capital_cost")) * ((1.0 + rate) ** delta_years)
+
+        for value_col, rate_col in [
             ("marginal_cost", "marginal_cost_annual_change"),
             ("co2_emissions", "co2_emissions_annual_change"),
-        ]
-
-        for value_col, rate_col in projection_pairs:
-            if value_col not in out.columns:
+        ]:
+            if value_col not in out.columns or pd.isna(row.get(value_col)):
                 continue
-            value = row.get(value_col)
-            if pd.isna(value):
-                continue
-
-            specific_rate = _normalize_annual_rate(row.get(rate_col, np.nan))
-            rate = specific_rate if specific_rate is not None else generic_rate
+            rate = _normalize_annual_rate(row.get(rate_col, np.nan))
             if rate is None:
-                continue
+                rate = generic_rate
+            if rate is not None:
+                out.at[idx, value_col] = float(row.get(value_col)) * ((1.0 + rate) ** delta_years)
 
-            out.at[idx, value_col] = float(value) * ((1.0 + rate) ** delta_years)
+        # Raw CAPEX takes the explicit annualization route.
+        capex = out.at[idx, "capex"] if "capex" in out.columns else np.nan
+        legacy_capital = out.at[idx, "capital_cost"] if "capital_cost" in out.columns else np.nan
+        if pd.notna(capex):
+            if pd.notna(legacy_capital):
+                raise ValueError(
+                    f"costs.csv[{row.get('cost_key', row.get('technology'))}] defines both capex and capital_cost. "
+                    "Use capex+r+n+fom, or legacy annualized capital_cost, not both."
+                )
+
+            capex = _require_finite_float(capex, f"costs.csv[{row.get('cost_key')}].capex")
+            r = _require_finite_float(row.get("discount_rate"), f"costs.csv[{row.get('cost_key')}].discount_rate")
+            n_years = _require_finite_float(row.get("lifetime_years"), f"costs.csv[{row.get('cost_key')}].lifetime_years")
+            fom = _require_finite_float(row.get("fom_fraction"), f"costs.csv[{row.get('cost_key')}].fom_fraction")
+            if capex < 0 or r < 0 or n_years <= 0 or fom < 0:
+                raise ValueError(
+                    f"Invalid annualization inputs for cost_key={row.get('cost_key')}: "
+                    f"capex={capex}, r={r}, n={n_years}, fom={fom}."
+                )
+
+            crf = (1.0 / n_years) if r == 0 else r * (1.0 + r) ** n_years / ((1.0 + r) ** n_years - 1.0)
+            out.at[idx, "capital_cost"] = capex * (crf + fom)
 
     return out
 
@@ -1120,36 +1190,74 @@ def _apply_cost_defaults(
     storage_df: Optional[pd.DataFrame],
     costs_df: Optional[pd.DataFrame],
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """Fill missing technology-specific columns in generator/storage CSVs from costs CSV."""
+    """Resolve component techno-economic parameters from costs.csv.
+
+    Generators are matched by ``cost_key`` (fallback: technology). This makes
+    costs.csv the source of truth even when legacy cost columns still exist in
+    generators_capacity.csv.
+    """
     if costs_df is None:
         return capacity_df, storage_df
 
     capacity_output = capacity_df.copy() if capacity_df is not None else None
     storage_output = storage_df.copy() if storage_df is not None else None
 
+    cost_table = costs_df.copy()
+    if "cost_key" not in cost_table.columns:
+        cost_table["cost_key"] = cost_table["technology"]
+    cost_table["_cost_key"] = cost_table["cost_key"].map(_normalize_label)
+
+    duplicates = cost_table[cost_table["_cost_key"].duplicated(keep=False)]
+    if not duplicates.empty:
+        raise ValueError(
+            "Projected costs contain duplicate cost_key rows: "
+            f"{sorted(duplicates['_cost_key'].unique().tolist())}"
+        )
+    cost_lookup = cost_table.set_index("_cost_key", drop=False)
+
     if capacity_output is not None:
-        generator_labels = capacity_output["generator"].map(_normalize_label)
-        if "technology" in capacity_output.columns:
-            technology_labels = capacity_output["technology"].map(_normalize_label)
-        else:
-            technology_labels = generator_labels
+        if "technology" not in capacity_output.columns:
+            capacity_output["technology"] = capacity_output["generator"]
+        if "cost_key" not in capacity_output.columns:
+            capacity_output["cost_key"] = capacity_output["technology"]
 
-        for _, row in costs_df.iterrows():
-            technology = _normalize_label(row["technology"])
-            mask = (generator_labels == technology) | (technology_labels == technology)
+        capacity_output["cost_key"] = capacity_output["cost_key"].map(_normalize_label)
 
+        # costs.csv is authoritative: ignore duplicated legacy values in capacity CSV.
+        for col in ["capital_cost", "marginal_cost", "efficiency"]:
+            capacity_output[col] = np.nan
+
+        missing_keys = sorted(set(capacity_output["cost_key"]) - set(cost_lookup.index))
+        if missing_keys:
+            raise ValueError(f"costs.csv is missing generator cost_key rows: {missing_keys}")
+
+        for idx, component_row in capacity_output.iterrows():
+            key = component_row["cost_key"]
+            cost_row = cost_lookup.loc[key]
             for col in ["capital_cost", "marginal_cost", "efficiency"]:
-                if col in row.index:
-                    if col not in capacity_output.columns:
-                        capacity_output[col] = np.nan
-                    capacity_output[col] = pd.to_numeric(capacity_output[col], errors="coerce").astype(float)
-                    capacity_output.loc[mask & capacity_output[col].isna(), col] = float(row[col])
+                if col not in cost_row.index or pd.isna(cost_row.get(col)):
+                    raise ValueError(f"costs.csv[{key}] is missing required generator parameter '{col}'.")
+                capacity_output.at[idx, col] = float(cost_row[col])
 
-    if storage_output is not None and not costs_df.empty:
-        # Pick the first row matching a common storage technology label.
-        storage_cost_row = costs_df[costs_df["technology"].astype(str).isin(["bess", "storage", "battery"])]
-        if not storage_cost_row.empty:
-            storage_cost_row = storage_cost_row.iloc[0]
+    if storage_output is not None and not storage_output.empty:
+        if "technology" not in storage_output.columns:
+            storage_output["technology"] = "bess"
+        if "cost_key" not in storage_output.columns:
+            storage_output["cost_key"] = storage_output["technology"]
+        storage_output["cost_key"] = storage_output["cost_key"].map(_normalize_label)
+
+        for idx, component_row in storage_output.iterrows():
+            key = component_row["cost_key"]
+            if key not in cost_lookup.index:
+                # Backward-compatible fallback by technology when cost_key differs.
+                tech = _normalize_label(component_row.get("technology", "bess"))
+                tech_matches = cost_table[cost_table["technology"].map(_normalize_label) == tech]
+                if len(tech_matches) != 1:
+                    raise ValueError(f"Unable to resolve storage cost_key='{key}' / technology='{tech}'.")
+                cost_row = tech_matches.iloc[0]
+            else:
+                cost_row = cost_lookup.loc[key]
+
             for col in [
                 "capital_cost",
                 "marginal_cost",
@@ -1158,11 +1266,11 @@ def _apply_cost_defaults(
                 "efficiency_dispatch",
                 "standing_loss",
             ]:
-                if col in storage_cost_row.index:
+                if col in cost_row.index and not pd.isna(cost_row.get(col)):
                     if col not in storage_output.columns:
                         storage_output[col] = np.nan
                     storage_output[col] = pd.to_numeric(storage_output[col], errors="coerce").astype(float)
-                    storage_output[col] = storage_output[col].fillna(float(storage_cost_row[col]))
+                    storage_output.at[idx, col] = float(cost_row[col])
 
     return capacity_output, storage_output
 
@@ -1214,10 +1322,59 @@ def _require_row_or_technology_attribute(
     cost_column: Optional[str] = None,
     context: str = "component",
 ) -> float:
-    """Read a value from the component row, otherwise require it from costs.csv."""
+    """Resolve component parameters while keeping costs.csv authoritative for economics.
+
+    Economic attributes (capital_cost and marginal_cost), plus a generic
+    technology ``efficiency`` field, are taken from the year-resolved costs.csv
+    whenever that technology/attribute is available. This prevents legacy cost
+    columns in hydrogen_assets.csv or ptx_assets.csv from silently overriding
+    the central cost table.
+
+    Asset-specific physical fields with different names (for example
+    ``heat_pump_cop`` or ``gas_boiler_efficiency``) still override technology
+    defaults. If a technology is not represented in costs.csv (e.g. an optional
+    UHS variant), the component-row value remains a backward-compatible fallback.
+    """
+    resolved_cost_column = cost_column or row_column
+    costs_first = resolved_cost_column in {"capital_cost", "marginal_cost"} or (
+        row_column == "efficiency" and resolved_cost_column == "efficiency"
+    )
+
+    if costs_first and costs_df is not None and not costs_df.empty:
+        lookup_key = _normalize_label(row.get("cost_key", technology), default=_normalize_label(technology))
+        if "cost_key" in costs_df.columns and resolved_cost_column in costs_df.columns:
+            matches = costs_df[costs_df["cost_key"].map(_normalize_label) == lookup_key]
+            usable = matches[matches[resolved_cost_column].notna()]
+            if len(usable) == 1:
+                return _require_finite_float(
+                    usable.iloc[0][resolved_cost_column],
+                    f"costs.csv[{lookup_key}].{resolved_cost_column}",
+                )
+            if len(usable) > 1:
+                raise ValueError(
+                    f"Ambiguous costs.csv lookup for cost_key='{lookup_key}', "
+                    f"column='{resolved_cost_column}'."
+                )
+
+        if "technology" in costs_df.columns and resolved_cost_column in costs_df.columns:
+            target = _normalize_label(technology)
+            matches = costs_df[costs_df["technology"].map(_normalize_label) == target]
+            usable = matches[matches[resolved_cost_column].notna()]
+            if len(usable) == 1:
+                return _require_finite_float(
+                    usable.iloc[0][resolved_cost_column],
+                    f"costs.csv[{technology}].{resolved_cost_column}",
+                )
+            if len(usable) > 1:
+                raise ValueError(
+                    f"Ambiguous costs.csv lookup for technology='{technology}', "
+                    f"column='{resolved_cost_column}'. Add/use a unique cost_key."
+                )
+
     if row_column in row.index and not pd.isna(row.get(row_column)):
         return _require_finite_float(row.get(row_column), f"{context}.{row_column}")
-    return _require_technology_attribute(costs_df, technology, cost_column or row_column)
+
+    return _require_technology_attribute(costs_df, technology, resolved_cost_column)
 
 
 def _require_technology_attribute(
@@ -1334,14 +1491,9 @@ def validate_inputs(
             if extra_zones:
                 warnings.append(f"Generators CSV references zones not in nodes CSV: {sorted(extra_zones)}")
 
-            missing_cols = []
-            for col in ["capital_cost", "marginal_cost", "efficiency"]:
-                if col not in capacity_df.columns:
-                    missing_cols.append(col)
-            if missing_cols:
+            if "cost_key" not in capacity_df.columns:
                 warnings.append(
-                    f"Generators CSV missing recommended columns: {missing_cols} "
-                    "(must be provided directly or through costs.csv)"
+                    "Generators CSV has no cost_key column; technology will be used as the cost lookup key."
                 )
         else:
             warnings.append(f"Generators capacity CSV not found: {csv_capacity}")
@@ -1444,6 +1596,12 @@ def validate_inputs(
         costs_df = load_technology_costs_from_csv(csv_costs)
         if costs_df is None:
             warnings.append(f"Costs CSV not found: {csv_costs} (required for strict config)")
+        elif capacity_df is not None and not capacity_df.empty:
+            available_cost_keys = set(costs_df["cost_key"].map(_normalize_label))
+            required_cost_keys = set(capacity_df["cost_key"].map(_normalize_label))
+            missing_cost_keys = sorted(required_cost_keys - available_cost_keys)
+            if missing_cost_keys:
+                errors.append(f"Costs CSV is missing generator cost_key rows: {missing_cost_keys}")
 
     # Report
     valid = len(errors) == 0
@@ -1777,20 +1935,6 @@ def map_weather_year(df_weather: pd.DataFrame, target_year: int = 2030) -> pd.Da
 
 def _safe_float(value, default: float) -> float:
     return default if pd.isna(value) else float(value)
-
-
-def _fraction_from_row(
-    row: pd.Series,
-    column: str,
-    default: float = 0.0,
-    *,
-    context: str = "component",
-) -> float:
-    """Read and validate a fractional CSV input in the closed interval [0, 1]."""
-    value = _safe_float(row.get(column, default), default)
-    if not 0.0 <= value <= 1.0:
-        raise ValueError(f"{context}.{column} must be between 0 and 1. Got {value}.")
-    return float(value)
 
 
 def _safe_year(value) -> Optional[int]:
@@ -2846,28 +2990,23 @@ def build_case_network(
                 default=False,
                 context=f"Storage asset {storage_id}.cyclic_state_of_charge",
             )
-            initial_soc_fraction = _fraction_from_row(
-                row,
-                "initial_soc_fraction",
-                default=0.0,
-                context=f"Storage asset {storage_id}",
-            )
+            initial_soc_fraction = _safe_float(row.get("initial_soc_fraction", np.nan), np.nan)
+            if np.isfinite(initial_soc_fraction):
+                if not 0.0 <= initial_soc_fraction <= 1.0:
+                    raise ValueError(f"Storage asset {storage_id}.initial_soc_fraction must be between 0 and 1.")
+                if cyclic_state_of_charge:
+                    raise ValueError(
+                        f"Storage asset {storage_id} defines initial_soc_fraction together with "
+                        "cyclic_state_of_charge=TRUE. Use only one initial-state mode."
+                    )
 
-            # PyPSA uses an absolute initial energy value (MWh), not a fraction.
-            # For an extendable StorageUnit, a non-zero fraction cannot be
-            # converted before p_nom_opt is known. Cyclic operation does not use
-            # state_of_charge_initial, so it remains valid for extendable BESS.
-            if expansion_allowed and not cyclic_state_of_charge and initial_soc_fraction > 0.0:
-                raise ValueError(
-                    f"Storage asset {storage_id} is extendable and has "
-                    f"initial_soc_fraction={initial_soc_fraction}. Use "
-                    "cyclic_state_of_charge=TRUE, set the fraction to 0, or add "
-                    "an explicit optimization constraint for a non-zero fraction."
-                )
-
-            state_of_charge_initial = (
-                0.0 if cyclic_state_of_charge else initial_soc_fraction * float(p_nom) * float(max_hours)
-            )
+            # For fixed capacity, PyPSA can receive the initial SOC directly in MWh.
+            # For extendable capacity, the initial fraction is imposed later through
+            # a custom first-snapshot energy-balance constraint tied to p_nom_opt.
+            if np.isfinite(initial_soc_fraction) and not expansion_allowed:
+                state_of_charge_initial = float(initial_soc_fraction) * float(p_nom) * float(max_hours)
+            else:
+                state_of_charge_initial = 0.0
 
             n.add(
                 "StorageUnit",
@@ -2884,18 +3023,20 @@ def build_case_network(
                 efficiency_dispatch=efficiency_dispatch,
                 standing_loss=standing_loss,
                 cyclic_state_of_charge=cyclic_state_of_charge,
-                state_of_charge_initial=state_of_charge_initial,
+                state_of_charge_initial=float(state_of_charge_initial),
             )
 
             if np.isfinite(p_nom_max):
                 n.storage_units.loc[storage_id, "p_nom_max"] = float(p_nom_max)
+            n.storage_units.loc[storage_id, "initial_soc_fraction"] = (
+                float(initial_soc_fraction) if np.isfinite(initial_soc_fraction) else np.nan
+            )
 
             # Metadata for result interpretation.
             n.storage_units.loc[storage_id, "commissioning_type"] = commissioning_status
             n.storage_units.loc[storage_id, "commissioning_year"] = (
                 float(commissioning_year) if commissioning_year is not None else np.nan
             )
-            n.storage_units.loc[storage_id, "initial_soc_fraction_input"] = float(initial_soc_fraction)
             if "asset_id" in row.index and pd.notna(row.get("asset_id")):
                 n.storage_units.loc[storage_id, "source_asset_id"] = str(row.get("asset_id"))
 
@@ -3009,26 +3150,38 @@ def build_case_network(
                 default=False,
                 context=f"Hydrogen store {asset_id}.cyclic_inventory",
             )
-            initial_inventory_fraction = _fraction_from_row(
-                row,
-                "initial_inventory_fraction",
-                default=0.0,
-                context=f"Hydrogen store {asset_id}",
+            initial_inventory_fraction = _safe_float(
+                row.get("initial_inventory_fraction", np.nan),
+                np.nan,
             )
+            final_inventory_fraction = _safe_float(
+                row.get("final_inventory_fraction", np.nan),
+                np.nan,
+            )
+            if np.isfinite(initial_inventory_fraction):
+                if not 0.0 <= initial_inventory_fraction <= 1.0:
+                    raise ValueError(f"Hydrogen store {asset_id}.initial_inventory_fraction must be between 0 and 1.")
+                if cyclic_inventory:
+                    raise ValueError(
+                        f"Hydrogen store {asset_id} defines initial_inventory_fraction together with "
+                        "cyclic_inventory=TRUE. Use only one initial-state mode."
+                    )
+            if np.isfinite(final_inventory_fraction):
+                if not 0.0 <= final_inventory_fraction <= 1.0:
+                    raise ValueError(f"Hydrogen store {asset_id}.final_inventory_fraction must be between 0 and 1.")
+                if cyclic_inventory:
+                    raise ValueError(
+                        f"Hydrogen store {asset_id} defines final_inventory_fraction together with "
+                        "cyclic_inventory=TRUE. Use cyclic inventory or an explicit terminal fraction, not both."
+                    )
 
-            # PyPSA's e_initial is an absolute inventory (MWh). A non-zero
-            # fractional initial inventory for an extendable Store needs an
-            # additional optimization constraint because e_nom_opt is unknown
-            # when the network is built. Cyclic Stores do not use e_initial.
-            if expansion_allowed and not cyclic_inventory and initial_inventory_fraction > 0.0:
-                raise ValueError(
-                    f"Hydrogen store {asset_id} is extendable and has "
-                    f"initial_inventory_fraction={initial_inventory_fraction}. Use "
-                    "cyclic_inventory=TRUE, set the fraction to 0, or add an "
-                    "explicit optimization constraint for a non-zero fraction."
-                )
-
-            e_initial = 0.0 if cyclic_inventory else initial_inventory_fraction * float(e_nom)
+            # Fixed Stores can use e_initial directly. Extendable Stores receive
+            # their optimized-capacity-dependent initial inventory later through
+            # a custom first-snapshot energy-balance constraint.
+            if np.isfinite(initial_inventory_fraction) and not expansion_allowed:
+                e_initial = float(initial_inventory_fraction) * float(e_nom)
+            else:
+                e_initial = 0.0
 
             attrs = dict(
                 bus=bus,
@@ -3040,14 +3193,19 @@ def build_case_network(
                 capital_cost=capital_cost,
                 marginal_cost=marginal_cost,
                 e_cyclic=cyclic_inventory,
-                e_initial=e_initial,
+                e_initial=float(e_initial),
             )
             if np.isfinite(e_nom_max):
                 attrs["e_nom_max"] = float(e_nom_max)
 
             n.add("Store", asset_id, **attrs)
             n.stores.loc[asset_id, "source_asset_type"] = asset_type
-            n.stores.loc[asset_id, "initial_inventory_fraction_input"] = float(initial_inventory_fraction)
+            n.stores.loc[asset_id, "initial_inventory_fraction"] = (
+                float(initial_inventory_fraction) if np.isfinite(initial_inventory_fraction) else np.nan
+            )
+            n.stores.loc[asset_id, "final_inventory_fraction"] = (
+                float(final_inventory_fraction) if np.isfinite(final_inventory_fraction) else np.nan
+            )
 
         for _, row in hydrogen_df.iterrows():
             zone = str(row["zone"]).strip()
@@ -4080,6 +4238,276 @@ def add_bidirectional_link_capacity_constraints(n, snapshots) -> None:
         )
 
 
+def _snapshot_storage_weight(n, snapshot) -> float:
+    """Return the storage snapshot weighting used in PyPSA energy balances."""
+    try:
+        return float(n.snapshot_weightings.loc[snapshot, "stores"])
+    except Exception:
+        try:
+            return float(n.snapshot_weightings.loc[snapshot])
+        except Exception:
+            return 1.0
+
+
+def _replace_first_energy_balance(
+    n,
+    snapshots,
+    *,
+    component: str,
+    constraint_name: str,
+    capacity_variable_name: str,
+    asset_ids: list[str],
+    initial_coefficients: pd.Series,
+) -> None:
+    """Replace only the first-snapshot balance for selected extendable assets.
+
+    PyPSA's ordinary non-cyclic balance uses a fixed scalar initial state. For
+    an extendable storage asset, this helper inserts an initial state equal to
+    a user-defined fraction of the optimized nominal capacity, while leaving
+    the terminal state unconstrained.
+    """
+    if not asset_ids:
+        return
+
+    model = n.model
+    if constraint_name not in model.constraints:
+        raise KeyError(
+            f"Expected PyPSA constraint {constraint_name!r} was not found. Check the installed PyPSA version."
+        )
+
+    balance = model.constraints[constraint_name]
+    lhs = balance.lhs
+    rhs = balance.rhs
+    first = snapshots[0]
+
+    first_lhs = lhs.loc[dict(snapshot=first)]
+    selected_lhs, component_dim = _select_linopy_by_labels(
+        first_lhs,
+        component,
+        asset_ids,
+    )
+    selected_rhs, rhs_dim = _select_linopy_by_labels(
+        rhs.loc[dict(snapshot=first)],
+        component,
+        asset_ids,
+    )
+    selected_rhs = _rename_linopy_dim(selected_rhs, rhs_dim, component_dim)
+
+    capacity = model.variables[capacity_variable_name]
+    selected_capacity, capacity_dim = _select_linopy_by_labels(
+        capacity,
+        component,
+        asset_ids,
+    )
+    selected_capacity = _rename_linopy_dim(
+        selected_capacity,
+        capacity_dim,
+        component_dim,
+    )
+
+    import xarray as xr
+
+    coeff = xr.DataArray(
+        initial_coefficients.loc[asset_ids].astype(float).values,
+        coords={component_dim: pd.Index(asset_ids, name=component_dim)},
+        dims=(component_dim,),
+    )
+    modified_first_lhs = selected_lhs + coeff * selected_capacity
+
+    all_ids = pd.Index(first_lhs.coords[component_dim].values.astype(str))
+    other_ids = [asset_id for asset_id in all_ids if asset_id not in set(asset_ids)]
+
+    # Save the original expressions, remove the original constraint family, and
+    # recreate it as: all later snapshots + untouched first-snapshot assets +
+    # the selected first-snapshot assets with optimized-capacity initial energy.
+    model.remove_constraints(constraint_name)
+
+    later_snapshots = snapshots[1:]
+    if len(later_snapshots):
+        model.add_constraints(
+            lhs.loc[dict(snapshot=later_snapshots)] == rhs.loc[dict(snapshot=later_snapshots)],
+            name=f"{constraint_name}_after_initial",
+        )
+
+    if other_ids:
+        other_lhs, other_dim = _select_linopy_by_labels(
+            first_lhs,
+            component,
+            other_ids,
+        )
+        other_rhs, other_rhs_dim = _select_linopy_by_labels(
+            rhs.loc[dict(snapshot=first)],
+            component,
+            other_ids,
+        )
+        other_rhs = _rename_linopy_dim(other_rhs, other_rhs_dim, other_dim)
+        model.add_constraints(
+            other_lhs == other_rhs,
+            name=f"{constraint_name}_first_default",
+        )
+
+    model.add_constraints(
+        modified_first_lhs == selected_rhs,
+        name=f"{constraint_name}_first_initial_fraction",
+    )
+
+
+def add_initial_storage_fraction_constraints(n, snapshots) -> None:
+    """Apply initial-only SOC/inventory fractions to extendable storage assets.
+
+    The fraction represents the state immediately before the first modeled
+    snapshot. It affects the first-hour energy balance but imposes no terminal
+    SOC/inventory condition.
+    """
+    first = snapshots[0]
+    weight = _snapshot_storage_weight(n, first)
+
+    if not n.storage_units.empty and "initial_soc_fraction" in n.storage_units.columns:
+        ids = []
+        coeffs = {}
+        for asset_id in n.storage_units.index.astype(str):
+            fraction = _safe_float(
+                n.storage_units.loc[asset_id, "initial_soc_fraction"],
+                np.nan,
+            )
+            if not np.isfinite(fraction):
+                continue
+            if not bool(n.storage_units.loc[asset_id, "p_nom_extendable"]):
+                continue
+
+            standing_loss = float(n.storage_units.loc[asset_id, "standing_loss"])
+            standing_factor = (1.0 - standing_loss) ** weight
+            max_hours = float(n.storage_units.loc[asset_id, "max_hours"])
+            ids.append(asset_id)
+            coeffs[asset_id] = standing_factor * fraction * max_hours
+
+        if ids:
+            _replace_first_energy_balance(
+                n,
+                snapshots,
+                component="StorageUnit",
+                constraint_name="StorageUnit-energy_balance",
+                capacity_variable_name="StorageUnit-p_nom",
+                asset_ids=ids,
+                initial_coefficients=pd.Series(coeffs, dtype=float),
+            )
+
+    if not n.stores.empty and "initial_inventory_fraction" in n.stores.columns:
+        ids = []
+        coeffs = {}
+        for asset_id in n.stores.index.astype(str):
+            fraction = _safe_float(
+                n.stores.loc[asset_id, "initial_inventory_fraction"],
+                np.nan,
+            )
+            if not np.isfinite(fraction):
+                continue
+            if not bool(n.stores.loc[asset_id, "e_nom_extendable"]):
+                continue
+
+            standing_loss = float(n.stores.loc[asset_id, "standing_loss"])
+            standing_factor = (1.0 - standing_loss) ** weight
+            ids.append(asset_id)
+            coeffs[asset_id] = standing_factor * fraction
+
+        if ids:
+            _replace_first_energy_balance(
+                n,
+                snapshots,
+                component="Store",
+                constraint_name="Store-energy_balance",
+                capacity_variable_name="Store-e_nom",
+                asset_ids=ids,
+                initial_coefficients=pd.Series(coeffs, dtype=float),
+            )
+
+
+def add_final_store_inventory_fraction_constraints(n, snapshots) -> None:
+    """Fix the final Store inventory to an optional fraction of capacity.
+
+    This applies only to Store components (for example, surface H2 storage and
+    UHS). The initial inventory remains controlled independently by
+    ``initial_inventory_fraction`` and the terminal condition is left free when
+    ``final_inventory_fraction`` is blank.
+    """
+    if n.stores.empty or "final_inventory_fraction" not in n.stores.columns:
+        return
+
+    active_ids = []
+    for asset_id in n.stores.index.astype(str):
+        fraction = _safe_float(
+            n.stores.loc[asset_id, "final_inventory_fraction"],
+            np.nan,
+        )
+        if np.isfinite(fraction):
+            active_ids.append(asset_id)
+
+    if not active_ids:
+        return
+
+    model = n.model
+    try:
+        store_e = model.variables["Store-e"]
+    except Exception:
+        return
+
+    last = snapshots[-1]
+    extendable_ids = [asset_id for asset_id in active_ids if bool(n.stores.loc[asset_id, "e_nom_extendable"])]
+    fixed_ids = [asset_id for asset_id in active_ids if not bool(n.stores.loc[asset_id, "e_nom_extendable"])]
+
+    if extendable_ids:
+        try:
+            store_e_nom = model.variables["Store-e_nom"]
+        except Exception:
+            store_e_nom = None
+
+        if store_e_nom is not None:
+            final_e, store_dim = _select_linopy_by_labels(
+                store_e.loc[dict(snapshot=last)],
+                "Store",
+                extendable_ids,
+            )
+            e_nom, e_nom_dim = _select_linopy_by_labels(
+                store_e_nom,
+                "Store",
+                extendable_ids,
+            )
+            e_nom = _rename_linopy_dim(e_nom, e_nom_dim, store_dim)
+
+            import xarray as xr
+
+            fractions = xr.DataArray(
+                n.stores.loc[extendable_ids, "final_inventory_fraction"].astype(float).values,
+                coords={store_dim: pd.Index(extendable_ids, name=store_dim)},
+                dims=(store_dim,),
+            )
+            model.add_constraints(
+                final_e == fractions * e_nom,
+                name="Store_final_inventory_fraction_extendable",
+            )
+
+    if fixed_ids:
+        import xarray as xr
+
+        final_e, store_dim = _select_linopy_by_labels(
+            store_e.loc[dict(snapshot=last)],
+            "Store",
+            fixed_ids,
+        )
+        target = xr.DataArray(
+            (
+                n.stores.loc[fixed_ids, "final_inventory_fraction"].astype(float).values
+                * n.stores.loc[fixed_ids, "e_nom"].astype(float).values
+            ),
+            coords={store_dim: pd.Index(fixed_ids, name=store_dim)},
+            dims=(store_dim,),
+        )
+        model.add_constraints(
+            final_e == target,
+            name="Store_final_inventory_fraction_fixed",
+        )
+
+
 def add_ptx_monthly_export_constraints(n, snapshots) -> None:
     """Force monthly PtX product exports to match ptx_monthly_demand.csv totals."""
     requirements = getattr(n, "_ptx_monthly_export_requirements", [])
@@ -4163,6 +4591,8 @@ def add_custom_constraints(n, snapshots) -> None:
     add_discrete_transmission_constraints(n, snapshots)
     add_bidirectional_link_capacity_constraints(n, snapshots)
     add_hydro_reservoir_soc_constraints(n, snapshots)
+    add_initial_storage_fraction_constraints(n, snapshots)
+    add_final_store_inventory_fraction_constraints(n, snapshots)
     add_ptx_monthly_export_constraints(n, snapshots)
 
 
@@ -4433,8 +4863,10 @@ def run_case(
                 opts.setdefault("MIPGap", float(mip_gap))
             if threads is not None:
                 opts.setdefault("Threads", int(threads))
-            opts.setdefault("OutputFlag", 0)
-            opts.setdefault("LogToConsole", 0)
+            opts.setdefault("OutputFlag", 1)
+            opts.setdefault("LogToConsole", 1)
+            # opts.setdefault("Method", 2)
+            opts.setdefault("Crossover", 0)
         elif target_solver == "highs":
             if time_limit is not None:
                 opts.setdefault("time_limit", float(time_limit))
